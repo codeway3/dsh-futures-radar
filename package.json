@@ -1,0 +1,89 @@
+{
+  "name": "dsh-futures-radar",
+  "version": "0.1.0",
+  "description": "DSH 插件：期货趋势雷达，基于加权指数的日线突破策略（临近/触发/止盈止损提醒，落盘复盘）",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "futures",
+    "trend",
+    "alert",
+    "期货",
+    "趋势"
+  ],
+  "license": "MIT",
+  "author": "codeway3",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json",
+    "./snapshot": "./snapshot.js",
+    "./journal": "./journal.js",
+    "./sectors": "./sectors.js",
+    "./trend": "./trend.js",
+    "./trend/monitor": "./trend-monitor.js",
+    "./trend/runtime": "./trend-runtime.js",
+    "./data/multipliers": "./data/multipliers.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "snapshot.js",
+    "journal.js",
+    "sectors.js",
+    "trend.js",
+    "trend-monitor.js",
+    "trend-runtime.js",
+    "cordis.patch.yml",
+    "data/catalog.json",
+    "data/multipliers.json",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "docs/trend-strategy.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check snapshot.js && node --check journal.js && node --check sectors.js && node --check trend.js && node --check trend-monitor.js && node --check trend-runtime.js && node --check scripts/trend-scan.mjs && node --check scripts/selftest-trend.mjs && node --check scripts/selftest-trend-monitor.mjs",
+    "selftest": "node scripts/selftest-trend.mjs && node scripts/selftest-trend-monitor.mjs",
+    "trend": "node scripts/trend-scan.mjs",
+    "selftest:trend": "node scripts/selftest-trend.mjs",
+    "selftest:trend:monitor": "node scripts/selftest-trend-monitor.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codeway3/dsh-futures-radar.git"
+  },
+  "homepage": "https://github.com/codeway3/dsh-futures-radar#readme",
+  "bugs": {
+    "url": "https://github.com/codeway3/dsh-futures-radar/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.3": "compatible",
+        "0.2.1-rc.5": "compatible"
+      }
+    }
+  }
+}

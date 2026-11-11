@@ -1,0 +1,5 @@
+# 行情雷达（futures-radar）bundle 层
+# 宿主注册 /futures-radar/api，客户端负责右下角提示与设置页。
+- insert:
+    - id: futures-radar
+      name: 'dsh-futures-radar'
