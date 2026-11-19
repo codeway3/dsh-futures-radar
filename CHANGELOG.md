@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## 0.1.1 — 2026-11-19
+
+### Added
+
+- Manual confirmation of real positions: enter actual fill price and lots before a signal enters
+  the holdings area; record an exit price later for review.
+- Action cards for tomorrow: direction, lots, entry, stop, 1R/2R targets, risk amount, volume ratio,
+  sector and `#rank`, with separate 0-lot observations and required-equity hints.
+- C1/C2 sizing profiles (structural stop + ATR buffer) and a draft/save config flow with an explicit
+  save/discard bar.
+- Replay reset from the monitor start date, so cleared historical positions no longer occupy
+  portfolio slots.
+- A sector backfill quality gate: the second slot in a sector requires volume ratio >= 1.3.
+- CLI fallback to the local cache when the upstream refresh fails (`source=cache`).
+
+### Changed
+
+- Signals page restructured: content scrolls inside the panel, action/manual-confirm sections are
+  shown first, and the layout uses a wider responsive grid.
+- Tasks and confirmations are ranked by volume ratio; 0-lot signals remain visible as observations
+  instead of disappearing or being counted as executable tasks.
+- `trend-scan.mjs` defaults to C1 and reports cache-sourced output distinctly.
+
+### Fixed
+
+- The same close confirmation could be pushed twice and with contradictory acceptance when the
+  night session crossed a trading day and equity/profile changed; a persistent `confirmSent` set now
+  suppresses the duplicate.
+- Confirmation reference prices drifted 2–4% after the night session because the main/weighted ratio
+  was recomputed from the current tick. The ratio is now anchored per signal day, re-derived from the
+  earliest confirmation log, and persisted.
+- Real-time trigger and position levels now use a pre-night settled anchor during the night session;
+  ratio jumps are journaled once per code/day.
+- Reference prices are rounded to known tick sizes (AG/AU/CU/AL/ZN/SN) with a 2-decimal fallback.
+- `seedSeen` could reference an undefined day; the confirm sent set and anchor cache are now seeded
+  and persisted across restarts.
+- Rejected/0-lot confirmations and tasks could disagree; sizing and portfolio decisions now share
+  the same 0-lot and backfill rules.
+
+### Tests
+
+- 28 strategy tests and 32 alert/runtime tests, including the equity-change + cross-trading-day
+  duplicate case, anchor stability, log-ratio precedence and legacy fallback.
+
 ## 0.1.0 — 2026-11-11
 
 First versioned release (the repository had no prior commits).

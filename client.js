@@ -8,14 +8,10 @@ window.__ModuleLoader__.load({
     const API = '/futures-radar/api'
     const CFG_KEY = 'dsh-futures-radar.config.v1'
     const DEFAULT_CFG = {
-      enabled: true,
-      equity: 0,
-      riskPct: 0.6,
+      equity: 1_000_000,
+      profile: 'C1',
       watch: '',
       exclude: '',
-      quietOn: false,
-      quietFrom: '11:25',
-      quietTo: '13:35',
       pauseUntil: 0,
     }
 
@@ -33,6 +29,8 @@ window.__ModuleLoader__.load({
       } catch (e) {
         /* 忽略 */
       }
+      // 老配置里 equity=0：按默认 100 万启动，避免所有信号都是 0 手
+      if (!Number(out.equity) || Number(out.equity) <= 0) out.equity = DEFAULT_CFG.equity
       cfgMemo = out
       return out
     }
@@ -56,28 +54,6 @@ window.__ModuleLoader__.load({
       }, [])
       return cfg
     }
-
-    /* ───────────── 静默与暂停 ───────────── */
-    /* @testable:quiet-start */
-    const toMins = (hhmm) => {
-      const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/)
-      if (!m) return null
-      return Number(m[1]) * 60 + Number(m[2])
-    }
-
-    /** 当前是否处于静默时段（支持跨零点）或暂停中 */
-    function isQuiet(cfg, now) {
-      const t = now instanceof Date ? now : new Date(now)
-      if (cfg.pauseUntil && t.getTime() < cfg.pauseUntil) return 'paused'
-      if (!cfg.quietOn) return null
-      const from = toMins(cfg.quietFrom)
-      const to = toMins(cfg.quietTo)
-      if (from === null || to === null || from === to) return null
-      const cur = t.getHours() * 60 + t.getMinutes()
-      const inside = from < to ? cur >= from && cur < to : cur >= from || cur < to
-      return inside ? 'quiet' : null
-    }
-    /* @testable:quiet-end */
 
     /* ───────────── 提示队列（纯函数，便于单测） ───────────── */
     /* @testable:toast-start */
@@ -231,6 +207,15 @@ window.__ModuleLoader__.load({
             s.abort = null
           }
         },
+        refresh() {
+          if (!s.alive) return
+          if (s.timer) clearTimeout(s.timer)
+          if (s.abort) {
+            try { s.abort.abort() } catch { /* 忽略 */ }
+            s.abort = null
+          }
+          s.timer = setTimeout(tick, 0)
+        },
         stats() {
           return {
             alive: s.alive,
@@ -288,7 +273,7 @@ window.__ModuleLoader__.load({
         cfg.watch ? 'codes=' + encodeURIComponent(cfg.watch) : '',
         cfg.exclude ? 'exclude=' + encodeURIComponent(cfg.exclude) : '',
         cfg.equity ? 'equity=' + encodeURIComponent(cfg.equity) : '',
-        cfg.riskPct ? 'risk=' + encodeURIComponent(cfg.riskPct) : '',
+        cfg.profile ? 'profile=' + encodeURIComponent(cfg.profile) : '',
       ]
         .filter(Boolean)
         .join('&')
@@ -307,6 +292,7 @@ window.__ModuleLoader__.load({
           at: json.at,
           alerts: Array.isArray(json.alerts) ? json.alerts : [],
           positions: Array.isArray(json.positions) ? json.positions : [],
+          zeroLots: Array.isArray(json.zeroLots) ? json.zeroLots : [],
           tasks: Array.isArray(json.tasks) ? json.tasks : [],
           recent: Array.isArray(json.recent) ? json.recent : [],
           confirmed: Array.isArray(json.confirmed) ? json.confirmed : [],
@@ -316,6 +302,12 @@ window.__ModuleLoader__.load({
           historical: Number(json.historical) || 0,
           confirmDay: json.confirmDay || null,
           confirmWindow: json.confirmWindow || null,
+          confirmPending: !!json.confirmPending,
+          profiles: Array.isArray(json.profiles) ? json.profiles : [],
+          capRejected: Array.isArray(json.capRejected) ? json.capRejected : [],
+          closedManual: Array.isArray(json.closedManual) ? json.closedManual : [],
+          refreshFailures: Number(json.refreshFailures) || 0,
+          profile: json.profile || 'C1',
           state: json.state || 'idle',
         }
         radar.err = null
@@ -342,7 +334,7 @@ window.__ModuleLoader__.load({
       const [, force] = useReducer((x) => x + 1, 0)
       const token = useRef(null)
       if (!token.current) token.current = Symbol('radar-sub')
-      const dep = [active, cfg.enabled, cfg.watch, cfg.exclude, cfg.equity, cfg.riskPct].join('|')
+      const dep = [active, cfg.watch, cfg.exclude, cfg.equity, cfg.profile].join('|')
 
       useEffect(() => {
         radar.subs.add(force)
@@ -357,12 +349,14 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         // 只有「组件活着 + 已启用」的订阅者才算真的需要数据
-        const want = !!(active && cfg.enabled)
+        const want = !!active
         if (want) {
           radar.wanted.add(token.current)
           radarStart({
             watch: cfg.watch,
             exclude: cfg.exclude,
+            equity: cfg.equity,
+            profile: cfg.profile,
           })
         } else {
           radar.wanted.delete(token.current)
@@ -370,7 +364,7 @@ window.__ModuleLoader__.load({
         }
       }, [dep])
 
-      return { state: radar.state, err: radar.err, shown: radar.shown }
+      return { state: radar.state, err: radar.err, shown: radar.shown, refresh: () => radarLoop.refresh() }
     }
 
     /* ───────────── 文案 ───────────── */
@@ -419,17 +413,17 @@ window.__ModuleLoader__.load({
       .frr-dock{position:fixed;right:14px;bottom:16px;z-index:60;display:flex;flex-direction:column;
         align-items:flex-end;gap:6px;pointer-events:none;font-size:11.5px;line-height:1.5}
       .frr-wrap{pointer-events:auto;display:flex;flex-direction:column;align-items:flex-end;gap:4px}
-      .frr-pill{display:inline-flex;align-items:center;gap:6px;max-width:360px;
+      .frr-pill{display:inline-flex;align-items:center;gap:6px;max-width:420px;min-width:0;
         padding:3px 6px 3px 8px;border-radius:8px;cursor:pointer;
         background:color-mix(in srgb, var(--dsw-alias-bg-l1,#1b1c1f) 90%, transparent);
         border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));
-        color:var(--dsw-alias-label-secondary,#9aa0a8);white-space:nowrap;
+        color:var(--dsw-alias-label-secondary,#9aa0a8);white-space:nowrap;overflow:hidden;
         -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);animation:frr-in .16s ease}
       .frr-pill:hover,.frr-pill:focus-visible{color:var(--dsw-alias-label-primary,#e6e8eb);
         outline:none;border-color:var(--dsw-alias-border-l1,rgba(255,255,255,.18))}
       .frr-dot{width:5px;height:5px;border-radius:50%;flex:none;background:var(--dsw-alias-label-quaternary,#6b7280)}
       .frr-name{color:var(--dsw-alias-label-tertiary,#868c94)}
-      .frr-why{color:var(--dsw-alias-label-quaternary,#6b7280)}
+      .frr-why{color:var(--dsw-alias-label-quaternary,#6b7280);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
       .frr-dir{font-weight:500}
       .frr-meta{color:var(--dsw-alias-label-quaternary,#6b7280);font-variant-numeric:tabular-nums}
       .frr-major{color:var(--dsw-alias-label-primary,#e6e8eb);
@@ -447,11 +441,11 @@ window.__ModuleLoader__.load({
       .frr-x{border:0;background:transparent;color:inherit;opacity:.45;cursor:pointer;
         font:inherit;font-size:11px;line-height:1;padding:2px 3px;border-radius:4px}
       .frr-x:hover,.frr-x:focus-visible{opacity:1;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}
-      .frr-card{width:280px;padding:9px 10px;border-radius:10px;
+      .frr-card{width:300px;padding:10px 11px;border-radius:10px;
         background:color-mix(in srgb, var(--dsw-alias-bg-l1,#1b1c1f) 96%, transparent);
         border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));
         color:var(--dsw-alias-label-secondary,#9aa0a8);white-space:normal;
-        font-size:11px;line-height:1.7;box-shadow:0 6px 20px rgba(0,0,0,.28)}
+        font-size:12px;line-height:1.7;box-shadow:0 6px 20px rgba(0,0,0,.28)}
       .frr-card-head{display:flex;align-items:baseline;gap:6px;margin-bottom:4px}
       .frr-card-title{color:var(--dsw-alias-label-primary,#e6e8eb);font-size:12px;font-weight:600}
       .frr-card-sub{color:var(--dsw-alias-label-quaternary,#6b7280);font-size:10px}
@@ -464,29 +458,128 @@ window.__ModuleLoader__.load({
         border-radius:6px;padding:1px 6px}
       @keyframes frr-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
       @media (prefers-reduced-motion: reduce){.frr-pill{animation:none}}
-      .frr-set{display:flex;flex-direction:column;gap:10px;font-size:12.5px;
-        color:var(--dsw-alias-label-secondary);max-width:600px}
-      .frr-set-title{color:var(--dsw-alias-label-primary);font-weight:600;font-size:13px}
-      .frr-set-desc{color:var(--dsw-alias-label-quaternary);font-size:11px;line-height:1.6}
-      .frr-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-      .frr-row>span:first-child{width:84px;flex:none;color:var(--dsw-alias-label-tertiary);font-size:12px}
-      .frr-set select,.frr-set input[type=text],.frr-set input[type=time]{font:inherit;font-size:12px;
-        padding:2px 6px;border-radius:6px;background:var(--dsw-alias-bg-l1,#1b1c1f);
+      /* ── 主页面：居中容器 + 卡片分区 ── */
+      .frr-page{box-sizing:border-box;width:min(100%,960px);max-width:960px;margin:0 auto;flex:0 1 auto;
+        padding:14px 16px 28px;font-size:13px;line-height:1.6;
+        height:100%;min-height:0;max-height:100%;overflow-y:auto;overflow-x:hidden;
+        overscroll-behavior:contain;scrollbar-gutter:stable;
+        scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.22) transparent;
+        color:var(--dsw-alias-label-secondary,#9aa0a8)}
+      .frr-page::-webkit-scrollbar{width:10px}
+      .frr-page::-webkit-scrollbar-track{background:transparent}
+      .frr-page::-webkit-scrollbar-thumb{background:rgba(255,255,255,.18);border-radius:999px;
+        border:2px solid transparent;background-clip:padding-box}
+      .frr-page::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.28);background-clip:padding-box}
+      /* 首屏优先：操作与手动确认放最前，别的卡片按原顺序排后 */
+      .frr-priority-1{order:-3}
+      .frr-priority-2{order:-2}
+      .frr-page *{box-sizing:border-box}
+      .frr-head{display:flex;align-items:center;gap:16px;
+        padding:2px 2px 10px;margin-bottom:12px;
+        border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1))}
+      .frr-head-main{min-width:0;flex:1 1 auto}
+      .frr-set-title{color:var(--dsw-alias-label-primary);font-weight:600;font-size:17px;letter-spacing:.01em}
+      .frr-set-desc{color:var(--dsw-alias-label-quaternary);font-size:12px;line-height:1.6;margin-top:4px;max-width:620px}
+      .frr-tabs{display:inline-flex;gap:3px;padding:3px;border-radius:10px;flex:none;
+        background:var(--dsw-alias-bg-l2,rgba(255,255,255,.04));
+        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08))}
+      .frr-tab{font:inherit;font-size:12.5px;padding:5px 16px;border:0;border-radius:7px;cursor:pointer;
+        background:transparent;color:var(--dsw-alias-label-tertiary,#868c94)}
+      .frr-tab.is-on{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.1));
+        color:var(--dsw-alias-label-primary,#e6e8eb)}
+      .frr-tab:hover{color:var(--dsw-alias-label-primary,#e6e8eb)}
+      .frr-badges{display:flex;flex-wrap:nowrap;gap:6px;margin:0 0 12px;align-items:center;
+        overflow-x:auto;scrollbar-width:none;padding-bottom:2px}
+      .frr-badges::-webkit-scrollbar{display:none}
+      .frr-badges>*{flex:none}
+      .frr-badge{display:inline-flex;align-items:baseline;gap:7px;padding:6px 11px;border-radius:8px;
+        background:var(--dsw-alias-bg-l1,#1b1c1f);
+        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08));font-size:11.5px}
+      .frr-badge b{color:var(--dsw-alias-label-primary,#e6e8eb);font-weight:600;font-size:13px;font-variant-numeric:tabular-nums}
+      .frr-badge span{color:var(--dsw-alias-label-quaternary,#6b7280)}
+      .frr-badge.warn b{color:#e8a44c}
+      /* 固定两栏 + 同行等高：列数与行高都不随容器宽度跳变，模块间不留参差空隙 */
+      .frr-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch}
+      .frr-panel{display:flex;flex-direction:column;background:var(--dsw-alias-bg-l1,#1b1c1f);
+        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.09));
+        border-radius:12px;padding:12px 14px;min-width:0}
+      .frr-panel.wide{grid-column:1/-1}
+      .frr-panel-head{display:flex;align-items:center;gap:9px;margin-bottom:8px;
+        padding-bottom:9px;border-bottom:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,.06))}
+      .frr-panel-title{font-size:12.5px;font-weight:600;color:var(--dsw-alias-label-primary,#e6e8eb);letter-spacing:.03em}
+      .frr-panel-count{font-size:11px;color:var(--dsw-alias-label-quaternary,#6b7280);
+        font-variant-numeric:tabular-nums;margin-left:auto}
+      .frr-list{display:flex;flex-direction:column}
+      .frr-list.scroll{max-height:320px;overflow:auto}
+      .frr-item{padding:9px 0;border-bottom:1px solid var(--dsw-alias-border-l3,rgba(255,255,255,.055))}
+      .frr-item:first-child{padding-top:2px}
+      .frr-item:last-child{border-bottom:0;padding-bottom:2px}
+      .frr-item-main{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+      .frr-item-name{font-weight:600;color:var(--dsw-alias-label-primary,#e6e8eb);font-size:13px}
+      .frr-item-meta{display:block;margin-top:4px;color:var(--dsw-alias-label-quaternary,#6b7280);
+        font-size:11.5px;line-height:1.65;font-variant-numeric:tabular-nums}
+      .frr-empty{flex:1 1 auto;display:flex;align-items:center;justify-content:center;min-height:56px;
+        padding:14px 4px;color:var(--dsw-alias-label-quaternary,#6b7280);font-size:12px;text-align:center}
+      .frr-rejected{opacity:.62}
+      .frr-up{color:#f05a5a}
+      .frr-down{color:#3fbf7f}
+      .frr-tag{display:inline-block;font-size:11px;line-height:1.5;padding:1px 8px;border-radius:999px;
+        color:var(--dsw-alias-label-tertiary,#868c94);border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.14))}
+      .frr-field{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+      .frr-field:last-child{margin-bottom:0}
+      .frr-field-label{width:76px;flex:none;color:var(--dsw-alias-label-tertiary,#868c94);font-size:12.5px}
+      .frr-field-ctrl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0}
+      .frr-page input,.frr-page select{font:inherit;font-size:12.5px;padding:5px 9px;border-radius:7px;
+        background:var(--dsw-alias-bg-l2,rgba(255,255,255,.04));
         color:var(--dsw-alias-label-primary,#e6e8eb);
-        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
-      .frr-set input[type=text]{width:190px}
-      .frr-set input[type=time]{width:96px}
-      .frr-set button{font:inherit;font-size:11.5px;padding:3px 10px;border-radius:6px;cursor:pointer;
+        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.14))}
+      .frr-page input[type=text]{width:210px}
+      .frr-page input[type=number]{width:140px}
+      .frr-page button{font:inherit;font-size:12px;padding:5px 11px;border-radius:7px;cursor:pointer;
         background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06));
         color:var(--dsw-alias-label-tertiary,#868c94);
         border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
-      .frr-set button:hover{color:var(--dsw-alias-label-primary,#e6e8eb)}
-      .frr-hint{color:var(--dsw-alias-label-quaternary);font-size:10.5px;line-height:1.6}
-      .frr-list{display:flex;flex-direction:column;gap:2px;font-size:11px;
-        font-variant-numeric:tabular-nums;max-height:220px;overflow:auto;min-width:240px}
-      .frr-list i{font-style:normal;color:var(--dsw-alias-label-quaternary)}
-      .frr-list-row{display:flex;gap:6px;align-items:baseline}
-      .frr-unread{color:var(--dsw-alias-label-primary,#e6e8eb)}
+      .frr-page button:hover,.frr-page button:focus-visible{color:var(--dsw-alias-label-primary,#e6e8eb)}
+      .frr-chip-on{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.12));
+        color:var(--dsw-alias-label-primary,#e6e8eb);border-color:var(--dsw-alias-border-l1,rgba(255,255,255,.26))}
+      .frr-savebar{grid-column:1/-1;display:flex;align-items:center;gap:8px;padding-top:2px}
+      .frr-primary{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.14)) !important;
+        color:var(--dsw-alias-label-primary,#e6e8eb) !important;border-color:var(--dsw-alias-border-l1,rgba(255,255,255,.28)) !important}
+      .frr-savebar button:disabled{opacity:.45;cursor:not-allowed}
+      .frr-manual-list{display:flex;flex-direction:column;gap:8px}
+      .frr-manual{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;
+        padding:8px 10px;background:var(--dsw-alias-bg-l2,rgba(255,255,255,.03))}
+      .frr-manual-fields{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px}
+      .frr-manual-fields label{display:flex;align-items:center;gap:4px;font-size:12px;
+        color:var(--dsw-alias-label-quaternary,#6b7280)}
+      .frr-manual-fields input{width:100px;font:inherit;font-size:12px;padding:2px 6px;border-radius:6px;
+        background:var(--dsw-alias-bg-l1,#1b1c1f);color:var(--dsw-alias-label-primary,#e6e8eb);
+        border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
+      .frr-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+      .frr-action{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;
+        padding:8px 10px;background:var(--dsw-alias-bg-l2,rgba(255,255,255,.03))}
+      .frr-action-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+      .frr-action-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 12px;margin-top:6px;font-size:12px}
+      .frr-action-grid span{display:flex;gap:6px;min-width:0}
+      .frr-action-grid i{color:var(--dsw-alias-label-quaternary,#6b7280);font-style:normal;flex:none}
+      /* 价位允许换行，避免止盈等长数字被省略号截断 */
+      .frr-action-grid b{color:var(--dsw-alias-label-primary,#e6e8eb);font-weight:500;
+        font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+      .frr-hint{color:var(--dsw-alias-label-quaternary,#6b7280);font-size:11.5px;line-height:1.6}
+      .frr-matches{display:flex;align-items:center;gap:6px;flex-wrap:wrap;width:100%;margin-top:2px}
+      .frr-note{color:var(--dsw-alias-label-quaternary,#6b7280);font-size:11.5px;line-height:1.7;margin:0 0 10px}
+      .frr-err{margin-top:14px;padding:9px 12px;border-radius:8px;font-size:12px;
+        color:#e88a7a;background:color-mix(in srgb, var(--dsw-alias-state-error-primary,#e05252) 10%, transparent);
+        border:1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary,#e05252) 30%, transparent)}
+      @media (max-width:720px){
+        .frr-page{padding:10px 10px 20px}
+        .frr-head{flex-direction:column;align-items:stretch}
+        .frr-field-label{width:100%}
+        .frr-grid,.frr-actions{grid-template-columns:1fr}
+      }
+      @media (min-width:721px) and (max-width:860px){
+        .frr-actions{grid-template-columns:repeat(2,minmax(0,1fr))}
+      }
     `
 
     function Styles() {
@@ -524,7 +617,7 @@ window.__ModuleLoader__.load({
         h('polyline', {
           points: pts,
           fill: 'none',
-          stroke: up ? 'var(--dsw-alias-label-secondary,#9aa0a8)' : 'var(--dsw-alias-label-tertiary,#868c94)',
+          stroke: up ? '#f05a5a' : '#3fbf7f',
           'stroke-width': '1.2',
           'stroke-linejoin': 'round',
         }),
@@ -619,22 +712,14 @@ window.__ModuleLoader__.load({
       const [ui, dispatchUi] = useReducer(detailReducer, DETAIL_INIT)
       const detail = ui.detail
       const paused = ui.paused
-      const [quietKind, setQuietKind] = useState(null)
+      const pausedUntil = cfg.pauseUntil || 0
 
-      // 静默/暂停：每秒检查一次，跨过静默边界要能自动恢复
+      // 新事件入队（暂停期间只入历史，不打扰）
       useEffect(() => {
-        const check = () => setQuietKind(isQuiet(cfg, Date.now()))
-        check()
-        const timer = setInterval(check, 15000)
-        return () => clearInterval(timer)
-      }, [cfg.quietOn, cfg.quietFrom, cfg.quietTo, cfg.pauseUntil])
-
-      // 新事件入队（静默/暂停期间只入历史，不打扰）
-      useEffect(() => {
-        if (!cfg.enabled || !state.alerts || !state.alerts.length) return
-        if (quietKind) return
+        if (!state.alerts || !state.alerts.length) return
+        if (pausedUntil > Date.now()) return
         dispatch({ type: 'push', items: state.alerts })
-      }, [state.at, cfg.enabled, quietKind])
+      }, [state.at, pausedUntil])
 
       // 「已弹出」必须在它真正成为当前展示项时才登记。
       // 写在入队处会提前标脏：前一条还开着详情时，后一条会被误标成"已弹出"。
@@ -671,7 +756,6 @@ window.__ModuleLoader__.load({
 
       const closeDetail = () => dispatchUi({ type: 'close' })
 
-      if (!cfg.enabled) return null
       // 只在有信号（toast）或错误时显示，不再常驻右下角
       if (!toast.current && !err) return null
 
@@ -712,12 +796,64 @@ window.__ModuleLoader__.load({
 
     /* ───────────── 设置页 ───────────── */
 
-    function SettingsSection() {
+    // 纯展示组件放在 RadarPage 外面：否则每次 setState 生成新组件类型，
+    // 输入框会被 React 卸载重建，表现为每输一位就丢焦点。
+    const dirCls = (d) => (d > 0 ? 'frr-up' : d < 0 ? 'frr-down' : '')
+    const Section = ({ title, count, wide, className, children }) =>
+      h('section', { className: 'frr-panel' + (wide ? ' wide' : '') + (className ? ' ' + className : '') },
+        h('div', { className: 'frr-panel-head' },
+          h('span', { className: 'frr-panel-title' }, title),
+          count != null ? h('span', { className: 'frr-panel-count' }, String(count)) : null,
+        ),
+        children,
+      )
+    const Item = ({ name, dir, meta, rejected, tag }) =>
+      h('div', { className: 'frr-item' + (rejected ? ' frr-rejected' : '') },
+        h('div', { className: 'frr-item-main' },
+          h('span', { className: 'frr-item-name ' + dirCls(dir) }, name),
+          tag || null,
+        ),
+        meta ? h('div', { className: 'frr-item-meta' }, meta) : null,
+      )
+    const Empty = ({ children }) => h('div', { className: 'frr-empty' }, children)
+
+    function RadarPage() {
       const cfg = useCfg()
-      const { state, err, shown } = useRadarScan(cfg, true)
+      const [tab, setTab] = useState('signals')
+      const { state, err, shown, refresh } = useRadarScan(cfg, true)
       const [watchDraft, setWatchDraft] = useState(cfg.watch || '')
       const [excludeDraft, setExcludeDraft] = useState(cfg.exclude || '')
+      const [equityDraft, setEquityDraft] = useState(cfg.equity ? String(cfg.equity) : '')
+      const [profileDraft, setProfileDraft] = useState(cfg.profile || 'C1')
+      const [manualDrafts, setManualDrafts] = useState({})
+      const [manualMsg, setManualMsg] = useState('')
       const [varieties, setVarieties] = useState([])
+
+      // 配置只改草稿，点“保存配置”才写入；权益输入不再失焦提交
+      useEffect(() => {
+        setEquityDraft(cfg.equity ? String(cfg.equity) : '')
+        setProfileDraft(cfg.profile || 'C1')
+        setWatchDraft(cfg.watch || '')
+        setExcludeDraft(cfg.exclude || '')
+      }, [cfg.equity, cfg.profile, cfg.watch, cfg.exclude])
+
+      const normalized = (v) => String(v ?? '').trim()
+      const cfgDirty = Number(equityDraft) !== Number(cfg.equity || 0) ||
+        profileDraft !== (cfg.profile || 'C1') ||
+        normalized(watchDraft) !== normalized(cfg.watch) ||
+        normalized(excludeDraft) !== normalized(cfg.exclude)
+      const saveCfg = () => writeCfg({
+        equity: Number(equityDraft) || 0,
+        profile: profileDraft,
+        watch: normalized(watchDraft),
+        exclude: normalized(excludeDraft),
+      })
+      const resetCfgDrafts = () => {
+        setEquityDraft(cfg.equity ? String(cfg.equity) : '')
+        setProfileDraft(cfg.profile || 'C1')
+        setWatchDraft(cfg.watch || '')
+        setExcludeDraft(cfg.exclude || '')
+      }
 
       // 品种目录只拉一次：用来支持"按名称找代码"（输中文也能搜到）
       useEffect(() => {
@@ -781,270 +917,482 @@ window.__ModuleLoader__.load({
       const pausedLeft = pauseUntil > Date.now() ? Math.ceil((pauseUntil - Date.now()) / 60000) : 0
       const stateText = STATE_TEXT[state.state] || '未知'
       const positions = state.positions || []
+      const zeroLots = state.zeroLots || []
       const tasks = state.tasks || []
       const recent = state.recent || []
+      const closedManual = state.closedManual || []
       const confirmed = state.confirmed || []
+      const rankOf = new Map(confirmed.map((c) => [c.code, c.rank]))
       const unconfirmed = state.unconfirmed || []
+      const manualCodes = new Set(positions.map((p) => p.code))
+      // 把「明日任务」和「收盘确认」合成一张可执行卡片：方向、手数、开仓、止损、止盈、风险
+      // 已手动确认的品种不再重复显示开仓任务
+      const actionRows = tasks
+        .filter((t) => !(manualCodes.has(t.code) && (t.action === 'open' || t.action === 'reverse')))
+        .map((t) => {
+        const c = confirmed.find((x) => x.code === t.code && (x.channel || 'main') === (t.channel || 'main'))
+        const entry = Number.isFinite(c?.entryRef) ? c.entryRef : (Number.isFinite(c?.closeMain) ? c.closeMain : t.close)
+        const stop = Number.isFinite(c?.stop) ? c.stop : (Number.isFinite(c?.estStop) ? c.estStop : null)
+        const risk = Number.isFinite(entry) && Number.isFinite(stop) ? Math.abs(entry - stop) : null
+        const tp1 = risk ? entry + (t.dir > 0 ? risk : -risk) : null
+        const tp2 = risk ? entry + (t.dir > 0 ? 2 * risk : -2 * risk) : null
+        return { ...t, c, entry, stop, risk, tp1, tp2, lots: Number.isFinite(c?.lots) ? c.lots : null, riskYuan: c?.riskYuan ?? null }
+      })
       const dirText = (d) => (d > 0 ? '多' : '空')
+      const manualCandidates = confirmed
+        .filter((c) => c.accepted !== false && Number(c.lots) > 0 && !manualCodes.has(c.code))
+        .sort((a, b) => (Number(b.vr) || 0) - (Number(a.vr) || 0))
+      const draftOf = (c) => manualDrafts[c.code] || {}
+      const setDraft = (code, patch) => setManualDrafts((prev) => ({ ...prev, [code]: { ...(prev[code] || {}), ...patch } }))
+      const confirmManual = async (c) => {
+        const d = draftOf(c)
+        const entry = Number(d.entry ?? c.entryRef ?? c.closeMain)
+        const lots = Number(d.lots ?? c.lots)
+        const stop = Number(c.stop ?? c.estStop)
+        if (!(entry > 0) || !(lots > 0) || !(stop > 0)) { setManualMsg('买入价/手数无效'); return }
+        const qs = new URLSearchParams({
+          op: 'trend', manual: 'open', code: c.code, name: c.name || '',
+          dir: String(c.dir), entryPrice: String(entry), stop: String(stop),
+          lots: String(Math.floor(lots)), equity: String(cfg.equity || 0), profile: cfg.profile || 'C1',
+        })
+        if (cfg.watch) qs.set('codes', cfg.watch)
+        if (cfg.exclude) qs.set('exclude', cfg.exclude)
+        try {
+          const res = await fetch(`${API}?${qs.toString()}`, { cache: 'no-store' })
+          const j = await res.json()
+          if (!j.ok) { setManualMsg(`确认失败：${j.error || '未知错误'}`); return }
+          setManualMsg(`已确认 ${c.name || c.code} ${dirText(c.dir)} @${entry} · ${Math.floor(lots)} 手`)
+          setManualDrafts((prev) => { const next = { ...prev }; delete next[c.code]; return next })
+          refresh()
+        } catch (e) {
+          setManualMsg('确认失败：' + String(e.message || e))
+        }
+      }
+
+      const closeManual = async (p) => {
+        const raw = window.prompt(`平仓价（${p.name || p.code}，入场 ${p.entryPrice}）`, String(p.entryPrice))
+        if (raw == null) return
+        const exitPrice = Number(raw)
+        if (!(exitPrice > 0)) { setManualMsg('平仓价无效'); return }
+        const qs = new URLSearchParams({
+          op: 'trend', manual: 'close', id: p.id, exitPrice: String(exitPrice),
+          equity: String(cfg.equity || 0), profile: cfg.profile || 'C1',
+        })
+        if (cfg.watch) qs.set('codes', cfg.watch)
+        if (cfg.exclude) qs.set('exclude', cfg.exclude)
+        try {
+          const res = await fetch(`${API}?${qs.toString()}`, { cache: 'no-store' })
+          const j = await res.json()
+          if (!j.ok) { setManualMsg(`平仓失败：${j.error || '未知错误'}`); return }
+          setManualMsg(`已平仓 ${p.name || p.code} @${exitPrice}`)
+          refresh()
+        } catch (e) {
+          setManualMsg('平仓失败：' + String(e.message || e))
+        }
+      }
+
+      // 顶部状态徽章：把原来一长串 "·" 拼接拆成独立可读的指标。
+      const badges = [
+        { label: '状态', value: stateText, warn: state.state === 'stale' || state.state === 'closed' },
+        { label: '权益', value: cfg.equity ? `${(cfg.equity / 10000).toFixed(0)} 万` : '未设置', warn: !cfg.equity },
+        state.date ? { label: '数据日', value: state.date } : null,
+        { label: '持仓', value: `${positions.length}/8` },
+        state.since ? { label: '监控起点', value: state.since } : null,
+        state.historical ? { label: '历史未监控', value: state.historical, warn: true } : null,
+        state.refreshFailures ? { label: '刷新失败', value: state.refreshFailures, warn: true } : null,
+        tasks.length ? { label: '明日任务', value: tasks.length } : null,
+        pausedLeft ? { label: '已暂停', value: `${pausedLeft} 分钟`, warn: true } : null,
+      ].filter(Boolean)
 
       return h(
         'div',
-        { className: 'frr-set' },
+        { className: 'frr-page' },
         h(Styles),
+
         h(
           'div',
-          null,
-          h('div', { className: 'frr-set-title' }, '趋势雷达'),
+          { className: 'frr-head' },
           h(
             'div',
-            { className: 'frr-set-desc' },
-            '加权指数日线突破策略：盘后出任务，盘中提醒临近/触发/止盈止损。本地计算，数据来自东财与新浪。',
-          ),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '状态'),
-          h(
-            'span',
-            { className: 'frr-hint' },
-            stateText +
-              (state.date ? ` · 数据日 ${state.date}` : '') +
-              (state.since ? ` · 监控起点 ${state.since}` : '') +
-              (state.historical ? ` · 历史持仓 ${state.historical} 未监控（止损/止盈不提醒）` : '') +
-              ` · 持仓 ${positions.length}/8` +
-              (tasks.length ? ` · 明日任务 ${tasks.length}` : '') +
-              (pausedLeft ? ` · 已暂停 ${pausedLeft} 分钟` : ''),
-          ),
-          h(
-            'button',
-            {
-              onClick: () =>
-                writeCfg({ pauseUntil: pausedLeft ? 0 : Date.now() + 30 * 60 * 1000 }),
-            },
-            pausedLeft ? '恢复提醒' : '暂停 30 分钟',
-          ),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '账户权益'),
-          h('input', {
-            type: 'number',
-            min: 0,
-            step: 10000,
-            value: cfg.equity || '',
-            placeholder: '动态权益，如 1000000',
-            style: { width: '130px' },
-            onChange: (e) => writeCfg({ equity: Number(e.target.value) || 0 }),
-          }),
-          h('span', null, '风险/笔'),
-          h('input', {
-            type: 'number',
-            min: 0.1,
-            max: 3,
-            step: 0.1,
-            value: cfg.riskPct || 0.6,
-            style: { width: '64px' },
-            onChange: (e) => writeCfg({ riskPct: Number(e.target.value) || 0.6 }),
-          }),
-          h('span', { className: 'frr-hint' }, '%'),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '启用'),
-          h('input', {
-            type: 'checkbox',
-            checked: cfg.enabled !== false,
-            onChange: (e) => writeCfg({ enabled: e.target.checked }),
-          }),
-          h('span', { className: 'frr-hint' }, '停止扫描'),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '自选品种'),
-          h('input', {
-            type: 'text',
-            value: watchDraft,
-            placeholder: '留空=默认品种，可输中文名，如 国债',
-            onChange: (e) => setWatchDraft(e.target.value),
-            onBlur: () => writeCfg({ watch: watchDraft.trim() }),
-            onKeyDown: (e) => {
-              if (e.key === 'Enter') writeCfg({ watch: watchDraft.trim() })
-            },
-          }),
-          h('span', { className: 'frr-hint' }, '只监控这些'),
-        ),
-        matchHint(watchDraft, (code) => {
-          const parts = watchDraft.split(/[,，\s]+/).filter(Boolean)
-          parts[parts.length - 1] = code
-          const next = parts.join(',')
-          setWatchDraft(next)
-          writeCfg({ watch: next })
-        }),
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '排除品种'),
-          h('input', {
-            type: 'text',
-            value: excludeDraft,
-            placeholder: '如 JR0,WH0',
-            onChange: (e) => setExcludeDraft(e.target.value),
-            onBlur: () => writeCfg({ exclude: excludeDraft.trim() }),
-            onKeyDown: (e) => {
-              if (e.key === 'Enter') writeCfg({ exclude: excludeDraft.trim() })
-            },
-          }),
-          h('span', { className: 'frr-hint' }, '不监控这些'),
-        ),
-        matchHint(excludeDraft, (code) => {
-          const parts = excludeDraft.split(/[,，\s]+/).filter(Boolean)
-          parts[parts.length - 1] = code
-          const next = parts.join(',')
-          setExcludeDraft(next)
-          writeCfg({ exclude: next })
-        }),
-
-        h(
-          'div',
-          { className: 'frr-row' },
-          h('span', null, '静默时段'),
-          h('input', {
-            type: 'checkbox',
-            checked: !!cfg.quietOn,
-            onChange: (e) => writeCfg({ quietOn: e.target.checked }),
-          }),
-          h('input', {
-            type: 'time',
-            value: cfg.quietFrom || '11:25',
-            onChange: (e) => writeCfg({ quietFrom: e.target.value }),
-          }),
-          h('span', { className: 'frr-hint' }, '至'),
-          h('input', {
-            type: 'time',
-            value: cfg.quietTo || '13:35',
-            onChange: (e) => writeCfg({ quietTo: e.target.value }),
-          }),
-          h('span', { className: 'frr-hint' }, '不弹窗，仍记历史'),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row', style: { alignItems: 'flex-start' } },
-          h('span', null, '当前持仓'),
-          h(
-            'div',
-            { className: 'frr-list' },
-            positions.length
-              ? positions.map((p) =>
-                  h(
-                    'div',
-                    { key: p.code + p.entryDate, className: 'frr-list-row' },
-                    h('span', null, `${p.name || p.code} ${dirText(p.dir)}`),
-                    h('i', null, `入 ${p.entryDate} @${Number(p.entryMain ?? p.entryPrice).toFixed(2)}` +
-                      (Number.isFinite(p.entryMain) ? '（主连）' : '')),
-                    Number.isFinite(p.stopMain ?? p.stopPrice)
-                      ? h('i', null, `止损 ${Number(p.stopMain ?? p.stopPrice).toFixed(2)}` +
-                        (Number.isFinite(p.stopMain) ? '（主连）' : ''))
-                      : null,
-                    Number.isFinite(p.weightPct)
-                      ? h('i', null, `仓位 ${p.weightPct.toFixed(0)}%`)
-                      : null,
-                    Number.isFinite(p.lots)
-                      ? h('i', null, `约 ${p.lots} 手${p.unverified ? '（乘数待核）' : ''}`)
-                      : null,
-                  ),
-                )
-              : [h('i', { key: 'empty' }, state.since ? `自 ${state.since} 起无新开仓` : '空仓')],
-          ),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row', style: { alignItems: 'flex-start' } },
-          h('span', null, '明日任务'),
-          h(
-            'div',
-            { className: 'frr-list' },
-            tasks.length
-              ? tasks.slice(0, 12).map((t) =>
-                  h(
-                    'div',
-                    { key: t.code + t.action + (t.dir || ''), className: 'frr-list-row' },
-                    h('span', null, `${t.name || t.code} ${t.action === 'close' ? '平' + dirText(t.dir) : t.action === 'reverse' ? '反手' + dirText(t.dir) : '开' + dirText(t.dir)}`),
-                    h('i', null, t.reason || ''),
-                  ),
-                )
-              : [h('i', { key: 'empty' }, '无')],
-          ),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row', style: { alignItems: 'flex-start' } },
-          h('span', null, `收盘确认${state.confirmDay ? `（${state.confirmDay}）` : ''}`),
-          h(
-            'div',
-            { className: 'frr-list' },
-            state.confirmWindow ? h('i', { key: 'window' }, `入场：${state.confirmWindow}`) : null,
-            state.confirmPending
-              ? [h('i', { key: 'pending' }, '日线尚未更新，收盘确认待定')]
-              : confirmed.length
-              ? confirmed.map((c) => {
-                  const f = (v) => (Number.isFinite(v) ? Number(v).toFixed(2) : '—')
-                  const ok = c.accepted !== false
-                  const label = c.channel === 'rebound' ? '辅2 反弹' : '通道突破'
-                  return h('div', { key: c.code, className: 'frr-list-row' },
-                    h('span', null, `${c.name || c.code} ${dirText(c.dir)}`),
-                    ok
-                      ? h('i', null, `参考开仓 ${f(c.entryRef ?? c.closeMain)} · 止损 ${f(c.stop ?? c.estStop)}` +
-                        (Number.isFinite(c.tp) ? ` · 2R 提示 ${f(c.tp)}` : '') +
-                        (Number.isFinite(c.lots) ? ` · 约 ${c.lots} 手` : ''))
-                      : h('i', null, `${label}信号已触发，但不开仓`),
-                    h('i', { key: 'status' }, ok
-                      ? `已过组合约束，按入场窗口执行${Number.isFinite(c.riskYuan) ? ` · 单笔风险约 ${Math.round(c.riskYuan).toLocaleString()} 元` : ''}`
-                      : `原因：${c.reject || '未进入开仓计划'}`),
-                  )
-                })
-              : [h('i', { key: 'empty' }, '暂无收盘确认')],
-            ...unconfirmed.slice(0, 8).map((u) =>
-              h('div', { key: 'u' + u.code, className: 'frr-list-row' },
-                h('span', null, `${u.name || u.code} 未确认`),
-                h('i', null, u.reason),
-              ),
+            { className: 'frr-head-main' },
+            h('div', { className: 'frr-set-title' }, '趋势雷达'),
+            h(
+              'div',
+              { className: 'frr-set-desc' },
+              '加权指数日线突破策略：盘后出任务，盘中提醒触发 / 收盘确认 / 止损止盈。本地计算，数据来自东财与新浪。',
             ),
           ),
-        ),
-
-        h(
-          'div',
-          { className: 'frr-row', style: { alignItems: 'flex-start' } },
-          h('span', null, '最近提醒'),
           h(
             'div',
-            { className: 'frr-list' },
-            recent.length
-              ? recent.slice(-12).reverse().map((a, i) =>
-                  h(
-                    'div',
-                    { key: a.code + a.kind + a.at + i, className: 'frr-list-row' },
-                    h('i', null, timeText(a.at)),
-                    h('span', null, `${KIND_TEXT[a.kind] || a.kind} ${a.name || a.code}`),
-                    h('i', null, a.text || ''),
-                  ),
-                )
-              : [h('i', { key: 'empty' }, '今日暂无提醒')],
+            { className: 'frr-tabs' },
+            h('button', { className: 'frr-tab' + (tab === 'signals' ? ' is-on' : ''), onClick: () => setTab('signals') }, '信号'),
+            h('button', { className: 'frr-tab' + (tab === 'config' ? ' is-on' : ''), onClick: () => setTab('config') }, '配置'),
           ),
         ),
 
-        err ? h('div', { className: 'frr-hint' }, '错误：' + err) : null,
+        tab === 'signals'
+          ? h(
+              'div',
+              null,
+              h(
+                'div',
+                { className: 'frr-badges' },
+                badges.map((b, i) =>
+                  h('span', { key: i, className: 'frr-badge' + (b.warn ? ' warn' : '') },
+                    h('span', null, b.label), h('b', null, String(b.value))),
+                ),
+                h(
+                  'button',
+                  { style: { marginLeft: 'auto' }, onClick: () => writeCfg({ pauseUntil: pausedLeft ? 0 : Date.now() + 30 * 60 * 1000 }) },
+                  pausedLeft ? '恢复提醒' : '暂停 30 分钟',
+                ),
+              ),
+              h(
+                'div',
+                { className: 'frr-grid' },
+                h(
+                  Section,
+                  { title: '当前持仓', count: positions.length },
+                  h(
+                    'div',
+                    { className: 'frr-list' },
+                    positions.length
+                      ? positions.map((p) =>
+                          h(Item, {
+                            key: p.code + p.entryDate,
+                            name: `${p.name || p.code} ${dirText(p.dir)}`,
+                            dir: p.dir,
+                            tag: p.manual ? h('button', { className: 'frr-x', onClick: () => closeManual(p) }, '平仓') : null,
+                            meta: [
+                              `入场 ${p.entryDate} @${Number(p.entryMain ?? p.entryPrice).toFixed(2)}${Number.isFinite(p.entryMain) ? '（主连）' : ''}${p.backfilled ? ' · 补算' : ''}`,
+                              Number.isFinite(p.stopMain ?? p.stopPrice) ? `止损 ${Number(p.stopMain ?? p.stopPrice).toFixed(2)}` : null,
+                              Number.isFinite(p.weightPct) ? `仓位 ${p.weightPct.toFixed(0)}%` : null,
+                              Number.isFinite(p.lots) ? `约 ${p.lots} 手${p.unverified ? '（乘数待核）' : ''}` : null,
+                            ].filter(Boolean).join(' · '),
+                          }),
+                        )
+                      : h(Empty, null, state.since ? `自 ${state.since} 起无新开仓` : '空仓'),
+                  ),
+                ),
+
+                closedManual.length
+                  ? h(
+                      Section,
+                      { title: '手动回顾', count: closedManual.length },
+                      h('div', { className: 'frr-list' },
+                        closedManual.slice().reverse().map((p) =>
+                          h(Item, {
+                            key: p.id,
+                            name: `${p.name || p.code} ${dirText(p.dir)}`,
+                            dir: p.dir,
+                            meta: `${p.entryDate} @${Number(p.entryPrice).toFixed(2)} → ${p.exitDate} @${Number(p.exitPrice).toFixed(2)} · ${p.pnlPct > 0 ? '+' : ''}${Number(p.pnlPct).toFixed(2)}%`,
+                          }),
+                        ),
+                      ),
+                    )
+                  : null,
+
+                zeroLots.length
+                  ? h(
+                      Section,
+                      { title: '0 手信号', count: zeroLots.length },
+                      h('div', { className: 'frr-list' },
+                        zeroLots.map((z) =>
+                          h(Item, {
+                            key: z.code + z.entryDate,
+                            name: `${z.name || z.code} ${dirText(z.dir)}`,
+                            dir: z.dir,
+                            meta: `${z.entryDate} @${Number(z.entryPrice).toFixed(2)} · ${z.reason || '0 手'} · 未开仓${z.backfilled ? '（补算）' : ''}`,
+                          }),
+                        ),
+                      ),
+                    )
+                  : null,
+
+                (state.capRejected || []).length
+                  ? h(
+                      Section,
+                      { title: '组合剔除', count: state.capRejected.length },
+                      h('div', { className: 'frr-list' },
+                        state.capRejected.map((p) =>
+                          h(Item, {
+                            key: p.code + p.entryDate,
+                            name: `${p.name || p.code} ${dirText(p.dir)}`,
+                            dir: p.dir,
+                            rejected: true,
+                            meta: p.reason || '超出组合上限',
+                          }),
+                        ),
+                      ),
+                    )
+                  : null,
+
+                h(
+                  Section,
+                  { title: '明日操作', count: actionRows.length, wide: true, className: 'frr-priority-1' },
+                  h('p', { className: 'frr-note' }, state.confirmWindow
+                    ? `执行：${state.confirmWindow}；低开超过参考价 0.5% 不追`
+                    : '明日开盘执行；低开超过参考价 0.5% 不追'),
+                  h(
+                    'div',
+                    { className: 'frr-actions' },
+                    actionRows.length
+                      ? actionRows.slice(0, 12).map((t) => {
+                          const fmt = (v) => (Number.isFinite(v) ? Number(v).toFixed(2) : '—')
+                          const act = t.action === 'close' ? '平' + dirText(t.dir) : t.action === 'reverse' ? '反手' + dirText(t.dir) : '开' + dirText(t.dir)
+                          const ok = t.c?.accepted !== false && (t.action === 'close' || (Number.isFinite(t.lots) && t.lots > 0))
+                          const rank = rankOf.get(t.code)
+                          const status = ok
+                            ? (t.backfill ? '补位' : (Number(t.vr) < 1.3 ? '可执行 · 量比偏低' : '可执行'))
+                            : (t.c?.lots === 0 ? '0 手观察' : '不开仓')
+                          const fields = [
+                            ['手数', Number.isFinite(t.lots) ? `${t.lots} 手` : '—'],
+                            ['开仓', fmt(t.entry)],
+                            ['止损', fmt(t.stop)],
+                            ['止盈①', Number.isFinite(t.tp1) ? fmt(t.tp1) : '—'],
+                            ['止盈②', Number.isFinite(t.tp2) ? fmt(t.tp2) : '—'],
+                            ['风险', t.riskYuan ? `${Math.round(t.riskYuan).toLocaleString()} 元` : '—'],
+                            ['量比', t.vr ? Number(t.vr).toFixed(2) : '—'],
+                            ['板块', t.sector || '—'],
+                            ['依据', t.reason || ''],
+                          ]
+                          return h('div', { key: t.code + t.action + (t.dir || ''), className: 'frr-action' + (ok ? '' : ' frr-rejected') },
+                            h('div', { className: 'frr-action-head' },
+                              h('span', { className: 'frr-item-name ' + dirCls(t.dir) }, `${t.name || t.code} ${act}`),
+                              h('span', { className: 'frr-tag' }, `${rank ? '#' + rank + ' ' : ''}${status}`),
+                            ),
+                            h('div', { className: 'frr-action-grid' },
+                              fields.map(([k, v]) => h('span', { key: k }, h('i', null, k), h('b', null, v))),
+                            ),
+                          )
+                        })
+                      : h(Empty, null, '明日无操作'),
+                  ),
+                ),
+
+                h(
+                  Section,
+                  { title: '手动确认（确认后才进持仓）', count: manualCandidates.length, wide: true, className: 'frr-priority-2' },
+                  manualMsg ? h('p', { className: 'frr-note' }, manualMsg) : null,
+                  h(
+                    'div',
+                    { className: 'frr-manual-list' },
+                    manualCandidates.length
+                      ? manualCandidates.map((c) => {
+                          const d = draftOf(c)
+                          const f = (v) => (Number.isFinite(v) ? Number(v).toFixed(2) : '—')
+                          return h('div', { key: c.code, className: 'frr-manual' },
+                            h('div', { className: 'frr-action-head' },
+                              h('span', { className: 'frr-item-name ' + dirCls(c.dir) }, `${c.name || c.code} ${dirText(c.dir)}`),
+                              h('span', { className: 'frr-tag' }, `#${c.rank || '—'} 待确认`),
+                            ),
+                            h('div', { className: 'frr-manual-fields' },
+                              h('label', null, '买入价',
+                                h('input', {
+                                  type: 'number', step: '0.01',
+                                  value: d.entry ?? String(Number(c.entryRef || 0).toFixed(2)),
+                                  onChange: (e) => setDraft(c.code, { entry: e.target.value }),
+                                }),
+                              ),
+                              h('label', null, '手数',
+                                h('input', {
+                                  type: 'number', min: '1', step: '1',
+                                  value: d.lots ?? String(c.lots || ''),
+                                  onChange: (e) => setDraft(c.code, { lots: e.target.value }),
+                                }),
+                              ),
+                              h('span', { className: 'frr-hint' }, `止损 ${f(c.stop ?? c.estStop)}`),
+                              h('button', { className: 'frr-primary', onClick: () => confirmManual(c) }, '确认买入'),
+                            ),
+                          )
+                        })
+                      : h(Empty, null, '暂无可确认信号'),
+                  ),
+                ),
+
+                h(
+                  Section,
+                  { title: `收盘确认${state.confirmDay ? ' · ' + state.confirmDay : ''}`, count: confirmed.length },
+                  h(
+                    'div',
+                    null,
+                    state.confirmWindow ? h('p', { className: 'frr-note' }, '入场：' + state.confirmWindow) : null,
+                    h(
+                      'div',
+                      { className: 'frr-list' },
+                      state.confirmPending
+                        ? h(Empty, null, '日线尚未更新，收盘确认待定')
+                        : confirmed.length
+                        ? confirmed.map((c) => {
+                            const f = (v) => (Number.isFinite(v) ? Number(v).toFixed(2) : '—')
+                            const ok = c.accepted !== false
+                            const label = c.channel === 'rebound' ? '辅2 反弹' : '通道突破'
+                            const req = Number.isFinite(c.requiredEquity)
+                              ? ` · 1 手约需权益 ${Math.ceil(c.requiredEquity / 10000).toLocaleString()} 万`
+                              : ''
+                            return h(Item, {
+                              key: c.code,
+                              name: `${c.name || c.code} ${dirText(c.dir)}`,
+                              dir: c.dir,
+                              rejected: !ok,
+                              tag: h('span', { className: 'frr-tag' },
+                                `${c.rank ? '#' + c.rank + ' ' : ''}${ok ? '过约束' : (c.lots === 0 ? '0 手观察' : '不开仓')}`),
+                              meta: ok
+                                ? `参考开仓 ${f(c.entryRef ?? c.closeMain)} · 止损 ${f(c.stop ?? c.estStop)}` +
+                                  (Number.isFinite(c.tp) ? ` · 2R ${f(c.tp)}` : '') +
+                                  (Number.isFinite(c.lots) ? ` · 约 ${c.lots} 手` : '') +
+                                  (Number.isFinite(c.riskYuan) ? ` · 单笔风险约 ${Math.round(c.riskYuan).toLocaleString()} 元` : '')
+                                : `${label}信号已触发 · 策略手数 ${Number.isFinite(c.lots) ? c.lots + ' 手' : '—'}${req} · 原因：${c.reject || '未进入开仓计划'}`,
+                            })
+                          })
+                        : h(Empty, null, '暂无收盘确认'),
+                      ...unconfirmed.slice(0, 8).map((u) =>
+                        h(Item, {
+                          key: 'u' + u.code,
+                          name: `${u.name || u.code} 未确认`,
+                          dir: 0,
+                          rejected: true,
+                          meta: u.reason,
+                        }),
+                      ),
+                    ),
+                  ),
+                ),
+
+                h(
+                  Section,
+                  { title: '最近提醒', count: recent.length, wide: true },
+                  h(
+                    'div',
+                    { className: 'frr-list scroll' },
+                    recent.length
+                      ? recent.slice(-12).reverse().map((a, i) =>
+                          h(Item, {
+                            key: a.code + a.kind + a.at + i,
+                            name: `${KIND_TEXT[a.kind] || a.kind} · ${a.name || a.code}`,
+                            dir: a.dir === 'up' ? 1 : a.dir === 'down' ? -1 : 0,
+                            tag: h('span', { className: 'frr-tag' }, timeText(a.at)),
+                            meta: a.text || '',
+                          }),
+                        )
+                      : h(Empty, null, '今日暂无提醒'),
+                  ),
+                ),
+              ),
+            )
+          : h(
+              'div',
+              { className: 'frr-grid' },
+              h(
+                Section,
+                { title: '定仓与权益' },
+                h(
+                  'div',
+                  { className: 'frr-field' },
+                  h('span', { className: 'frr-field-label' }, '账户权益'),
+                  h(
+                    'div',
+                    { className: 'frr-field-ctrl' },
+                    h('input', {
+                      type: 'number',
+                      min: 0,
+                      step: 10000,
+                      value: equityDraft,
+                      placeholder: '动态权益，如 1000000',
+                      onChange: (e) => setEquityDraft(e.target.value.replace(/[^\d]/g, '')),
+                      onKeyDown: (e) => { if (e.key === 'Enter') e.currentTarget.blur() },
+                    }),
+                    h('span', { className: 'frr-hint' }, '单笔风险由定仓方案决定'),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'frr-field' },
+                  h('span', { className: 'frr-field-label' }, '定仓方案'),
+                  h(
+                    'div',
+                    { className: 'frr-field-ctrl' },
+                    (state.profiles && state.profiles.length
+                      ? state.profiles
+                      : [{ key: 'C1', label: 'C1 保守' }, { key: 'C2', label: 'C2 观察' }]
+                    ).map((p) =>
+                      h('button', {
+                        key: p.key,
+                        className: 'frr-tab' + (profileDraft === p.key ? ' is-on' : ''),
+                        onClick: () => setProfileDraft(p.key),
+                      }, p.label),
+                    ),
+                    h('span', { className: 'frr-hint' }, 'C1 默认；C2 仅作对比'),
+                  ),
+                ),
+              ),
+              h(
+                Section,
+                { title: '品种筛选' },
+                h(
+                  'div',
+                  { className: 'frr-field' },
+                  h('span', { className: 'frr-field-label' }, '自选品种'),
+                  h(
+                    'div',
+                    { className: 'frr-field-ctrl' },
+                    h('input', {
+                      type: 'text',
+                      value: watchDraft,
+                      placeholder: '留空=默认品种，可输中文名，如 国债',
+                      onChange: (e) => setWatchDraft(e.target.value),
+                    }),
+                    matchHint(watchDraft, (code) => {
+                      const parts = watchDraft.split(/[,，\s]+/).filter(Boolean)
+                      parts[parts.length - 1] = code
+                      const next = parts.join(',')
+                      setWatchDraft(next)
+                      /* draft only */
+                    }),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'frr-field' },
+                  h('span', { className: 'frr-field-label' }, '排除品种'),
+                  h(
+                    'div',
+                    { className: 'frr-field-ctrl' },
+                    h('input', {
+                      type: 'text',
+                      value: excludeDraft,
+                      placeholder: '如 JR0,WH0',
+                      onChange: (e) => setExcludeDraft(e.target.value),
+                    }),
+                    matchHint(excludeDraft, (code) => {
+                      const parts = excludeDraft.split(/[,，\s]+/).filter(Boolean)
+                      parts[parts.length - 1] = code
+                      const next = parts.join(',')
+                      setExcludeDraft(next)
+                      /* draft only */
+                    }),
+                  ),
+                ),
+                h('p', { className: 'frr-note' }, '输入中文名可搜索合约代码，点候选标签即可填入；留空表示使用默认品种池。'),
+                h('div', { className: 'frr-savebar' },
+                  h('button', { className: 'frr-primary', disabled: !cfgDirty, onClick: saveCfg }, '保存配置'),
+                  h('button', { disabled: !cfgDirty, onClick: resetCfgDrafts }, '放弃修改'),
+                  h('span', { className: 'frr-hint' }, cfgDirty ? '有未保存修改' : '已保存'),
+                ),
+              ),
+            ),
+
+        err ? h('div', { className: 'frr-err' }, '错误：' + err) : null,
+      )
+    }
+
+    function RadarSidebarIcon() {
+      return h(
+        'svg',
+        { width: 18, height: 18, viewBox: '0 0 24 24', fill: 'none', 'aria-hidden': 'true' },
+        h('circle', { cx: 12, cy: 12, r: 8.5, stroke: 'currentColor', strokeWidth: 1.7 }),
+        h('path', { d: 'M12 3.5V12l6 3.5', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' }),
+        h('circle', { cx: 12, cy: 12, r: 1.6, fill: 'currentColor' }),
       )
     }
 
@@ -1056,11 +1404,14 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('shell.overlay', () =>
           ctx.slots.register({ name: 'shell.overlay', id: 'futures-radar-toast', order: 60 }, RadarDock),
         )
-        ctx.slots.inject('settings.section', () =>
+        ctx.slots.inject('sidebar.panellist', () =>
           ctx.slots.register(
-            { name: 'settings.section', id: 'futures-radar', order: 52, label: '趋势雷达' },
-            SettingsSection,
+            { name: 'sidebar.panellist', id: 'dsh-futures-radar', order: 31, label: () => '趋势雷达' },
+            RadarSidebarIcon,
           ),
+        )
+        ctx.slots.inject('main', () =>
+          ctx.slots.register({ name: 'main', key: 'dsh-futures-radar' }, RadarPage),
         )
       },
     }

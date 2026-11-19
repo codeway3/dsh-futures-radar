@@ -18,10 +18,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { sectorOf } from '../sectors.js'
-import { defaultStartPath } from '../trend-runtime.js'
+import { defaultStartPath, defaultTrendCachePath } from '../trend-runtime.js'
 import {
-  TREND_DEFAULTS, REBOUND_CONFIG, computeSeries, planVariety, replaySeries, buildPlan, applyPortfolio, stopLevel, breakoutSignal, reboundSignal, liquidityOk, positionWeight,
+  TREND_DEFAULTS, REBOUND_CONFIG, SIZING_PROFILES,
+  computeSeries, planVariety, replaySeries, buildPlan, applyPortfolio, stopLevel, breakoutSignal, reboundSignal, liquidityOk, positionWeight,
 } from '../trend.js'
+
+const CFG = { ...TREND_DEFAULTS, ...SIZING_PROFILES.C1 }
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
@@ -125,6 +128,21 @@ async function main() {
 
   const ok = fetched.filter((x) => x.bars)
   const failed = fetched.filter((x) => x.error)
+  let usedCache = false
+  // 上游全挂时降级读本地日线缓存，并明确标注
+  if (failed.length) {
+    try {
+      const cache = JSON.parse(fs.readFileSync(defaultTrendCachePath(), 'utf8'))
+      for (const f of failed) {
+        const raw = cache?.bars?.[f.v]
+        if (!Array.isArray(raw) || raw.length < CFG.warmup) continue
+        const bars = args.date ? raw.filter((b) => b.date <= args.date) : raw
+        if (bars.length < CFG.warmup) continue
+        ok.push({ c: f.c, v: f.v, bars, name: f.c.label || f.c.name })
+        usedCache = true
+      }
+    } catch { /* 没有缓存就保持空结果 */ }
+  }
 
   // 1) 每个品种独立回放，收集全部仓位与今日任务
   const allPositions = []
@@ -134,19 +152,19 @@ async function main() {
   for (const item of ok) {
     const sector = sectorOf(item.c.code) || '其他'
     const name = item.c.label || item.c.name
-    const series = computeSeries(item.bars, TREND_DEFAULTS)
-    if (!liquidityOk(series, TREND_DEFAULTS, item.v)) { illiquid.push(item.v); continue }
+    const series = computeSeries(item.bars, CFG)
+    if (!liquidityOk(series, CFG, item.v)) { illiquid.push(item.v); continue }
     lastDate = series[series.length - 1].date
 
-    const main = replaySeries(series, { cfg: TREND_DEFAULTS, signalFn: (s, i) => breakoutSignal(s[i], TREND_DEFAULTS), sector })
+    const main = replaySeries(series, { cfg: CFG, signalFn: (s, i) => breakoutSignal(s[i], CFG), sector })
     for (const t of main.trades) {
       allPositions.push({ code: item.c.code, name, sector, dir: t.dir, channel: 'main', entryDate: t.entryDate, exitDate: t.exitDate, entryPrice: t.entryPrice, exitPrice: t.exitPrice, pnlPct: t.pnlPct, exitReason: t.exitReason })
     }
     if (main.pos) {
-      const st = stopLevel(series[series.length - 1], main.pos, TREND_DEFAULTS)
-      allPositions.push({ code: item.c.code, name, sector, dir: main.pos.dir, channel: 'main', entryDate: main.pos.entryDate, exitDate: null, entryPrice: main.pos.entryPrice, pnlPct: ((series[series.length - 1].c / main.pos.entryPrice) - 1) * 100 * main.pos.dir, exitReason: null, stopPrice: st, weightPct: positionWeight(main.pos.entryPrice, main.pos.stopPrice).weightPct })
+      const st = stopLevel(series[series.length - 1], main.pos, CFG)
+      allPositions.push({ code: item.c.code, name, sector, dir: main.pos.dir, channel: 'main', entryDate: main.pos.entryDate, exitDate: null, entryPrice: main.pos.entryPrice, pnlPct: ((series[series.length - 1].c / main.pos.entryPrice) - 1) * 100 * main.pos.dir, exitReason: null, stopPrice: st, weightPct: positionWeight(main.pos.entryPrice, main.pos.stopPrice, { riskPct: CFG.riskPct, maxWeightPct: CFG.maxWeightPct }).weightPct })
     }
-    const task = planVariety(series, { cfg: TREND_DEFAULTS, channel: 'main', sector })
+    const task = planVariety(series, { cfg: CFG, channel: 'main', sector })
     if (task) todayTasks.push({ ...task, code: item.c.code, var: item.v, name, channel: 'main' })
 
     const seriesR = computeSeries(item.bars, REBOUND_CONFIG)
@@ -156,14 +174,14 @@ async function main() {
     }
     if (rb.pos) {
       const stR = stopLevel(seriesR[seriesR.length - 1], rb.pos, REBOUND_CONFIG)
-      allPositions.push({ code: item.c.code, name, sector, dir: rb.pos.dir, channel: 'rebound', entryDate: rb.pos.entryDate, exitDate: null, entryPrice: rb.pos.entryPrice, pnlPct: ((seriesR[seriesR.length - 1].c / rb.pos.entryPrice) - 1) * 100 * rb.pos.dir, exitReason: null, stopPrice: stR, weightPct: positionWeight(rb.pos.entryPrice, rb.pos.stopPrice).weightPct })
+      allPositions.push({ code: item.c.code, name, sector, dir: rb.pos.dir, channel: 'rebound', entryDate: rb.pos.entryDate, exitDate: null, entryPrice: rb.pos.entryPrice, pnlPct: ((seriesR[seriesR.length - 1].c / rb.pos.entryPrice) - 1) * 100 * rb.pos.dir, exitReason: null, stopPrice: stR, weightPct: positionWeight(rb.pos.entryPrice, rb.pos.stopPrice, { riskPct: CFG.riskPct, maxWeightPct: CFG.maxWeightPct }).weightPct })
     }
     const taskR = planVariety(seriesR, { cfg: REBOUND_CONFIG, channel: 'rebound', sector })
     if (taskR) todayTasks.push({ ...taskR, code: item.c.code, var: item.v, name, channel: 'rebound' })
   }
 
   // 2) 组合层回放：只有被接受的仓位才真实存在
-  const { accepted } = applyPortfolio(allPositions, TREND_DEFAULTS)
+  const { accepted } = applyPortfolio(allPositions, CFG)
   const allOpen = accepted.filter((p) => p.exitDate === null || p.exitDate >= lastDate)
   // 与宿主一致：监控起点之前的仓位算历史
   let since = null
@@ -177,7 +195,7 @@ async function main() {
 
   // 3) 明日任务：只保留被接受持仓的平仓/反手 + 通过风控的新开仓
   const openVars = openPositions.map((p) => ({ code: p.code, sector: p.sector, dir: p.dir }))
-  const plan = buildPlan(todayTasks, openVars, TREND_DEFAULTS)
+  const plan = buildPlan(todayTasks, openVars, CFG)
   // 只保留真实持仓的平仓任务（信号持仓可能被组合层拒绝过）
   const closes = plan.closes.filter((t) => heldCodes.has(t.code))
 
@@ -185,6 +203,7 @@ async function main() {
     console.log(JSON.stringify({
       date: lastDate,
       scanned: ok.length,
+      source: usedCache ? 'cache' : 'live',
       failed: failed.map((f) => ({ code: f.c.code, error: f.error })),
       openPositions,
       closes,
@@ -198,13 +217,13 @@ async function main() {
   console.log('')
   console.log(`  趋势雷达 · 盘后扫描   数据截止 ${lastDate}   品种 ${ok.length}/${fetched.length}`)
   if (failed.length) console.log(`  跳过：${failed.map((f) => `${f.c.code}(${f.error})`).join('  ')}`)
-  if (illiquid.length) console.log(`  流动性不足（均量<${TREND_DEFAULTS.minVol20}）不监控：${illiquid.join(' ')}`)
+  if (illiquid.length) console.log(`  流动性不足（均量<${CFG.minVol20}）不监控：${illiquid.join(' ')}`)
   console.log('')
   if (since) {
     const hidden = allOpen.length - openPositions.length
     console.log(`  监控起点 ${since}：历史持仓 ${hidden} 个不计入（--all 显示全部）`)
   }
-  console.log(`  ── 当前持仓（组合层约束后 ${openPositions.length}/${TREND_DEFAULTS.maxPositions}）──`)
+  console.log(`  ── 当前持仓（组合层约束后 ${openPositions.length}/${CFG.maxPositions}）──`)
   if (!openPositions.length) console.log('    （空仓）')
   for (const p of openPositions.sort((a, b) => (b.pnlPct || 0) - (a.pnlPct || 0))) {
     const stop = p.stopPrice ? `止损 ${p.stopPrice.toFixed(2)}` : ''
@@ -227,6 +246,7 @@ async function main() {
     for (const t of plan.rejected) console.log(`    ${t.code.padEnd(7)} ${String(t.name).padEnd(10)} ${t.reject}${t.vr ? `（量比 ${Number(t.vr).toFixed(2)}）` : ''}`)
   }
   console.log('')
+  if (usedCache) console.log('  ⚠ 上游请求失败，已降级使用本地缓存日线；结果可能滞后，请以宿主刷新后的数据为准。')
   console.log('  提示：加权指数不可交易，实际成交在次日开盘的主连合约。')
   console.log('')
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-futures-radar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH 插件：期货趋势雷达，基于加权指数的日线突破策略（临近/触发/止盈止损提醒，落盘复盘）",
   "keywords": [
     "dsh",

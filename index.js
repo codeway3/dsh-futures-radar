@@ -156,7 +156,29 @@ export function apply(ctx) {
         }
         const equity = Number(url.searchParams.get('equity') || 0) || 0
         const riskPct = Number(url.searchParams.get('risk') || 0) || undefined
-        const body = await trendRuntime.tick({ equity, riskPct })
+        const profile = url.searchParams.get('profile') || undefined
+        const manualAction = url.searchParams.get('manual')
+        if (manualAction === 'open') {
+          const result = trendRuntime.manualOpen({
+            code: url.searchParams.get('code') || '',
+            name: url.searchParams.get('name') || '',
+            dir: Number(url.searchParams.get('dir')),
+            entryPrice: Number(url.searchParams.get('entryPrice')),
+            stop: Number(url.searchParams.get('stop')),
+            lots: Number(url.searchParams.get('lots')),
+          })
+          respond(res, result.ok ? 200 : 400, result)
+          return
+        }
+        if (manualAction === 'close') {
+          const result = trendRuntime.manualClose({
+            id: url.searchParams.get('id') || '',
+            exitPrice: Number(url.searchParams.get('exitPrice')),
+          })
+          respond(res, result.ok ? 200 : 400, result)
+          return
+        }
+        const body = await trendRuntime.tick({ equity, riskPct, profile })
         respond(res, 200, body)
         return
       }

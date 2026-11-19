@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { TREND_DEFAULTS, computeSeries } from '../trend.js'
-import { tradingDayOf, entryWindowText } from '../trend-runtime.js'
+import { tradingDayOf, entryWindowText, mergeBars } from '../trend-runtime.js'
 import {
   buildMonitorLevels, takeProfitPrice, evaluateOne, evaluateTicks, MONITOR_DEFAULTS,
 } from '../trend-monitor.js'
@@ -181,6 +181,8 @@ await testAsync('runtime：收盘确认 + 手数计算（mock 大涨放量）', 
   })
   bars[bars.length - 1].v = 30000 // 放量，满足量比；同时过流动性门槛
   fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date(todayStr + 'T15:20:00+08:00').getTime(), bars: { RB: bars } }))
+  // 预置当天已推送的确认键：seedSeen 必须把它种进 seen，否则重载后会重复提醒
+  fs.writeFileSync(path.join(tmp, 'suppress.json'), JSON.stringify({ day: todayStr, keys: ['RB0|confirm|2026-11-11'] }))
   const rt = createTrendRuntime({
     codes: ['RB0'],
     catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
@@ -195,6 +197,7 @@ await testAsync('runtime：收盘确认 + 手数计算（mock 大涨放量）', 
   })
   const body = await rt.tick({ equity: 1000000, riskPct: 0.6 })
   assert.equal(body.confirmed.length, 1, '应确认 1 个突破')
+  assert.equal((body.alerts || []).filter((a) => a.kind === 'confirm').length, 0, 'suppress 应抑制已推送的确认')
   assert.equal(body.confirmed[0].code, 'RB0')
   assert.ok(Number.isFinite(body.confirmed[0].lots) && body.confirmed[0].lots > 0, '应算出手数')
   const c0 = body.confirmed[0]
@@ -519,6 +522,72 @@ await testAsync('runtime：21:00 后打开也能补做当天收盘确认，且�
   assert.equal(b2.alerts.filter((a) => a.kind === 'confirm').length, 0, '不应重复推确认')
 })
 
+await testAsync('runtime：权益变更跨交易日不重复推确认，且价格锚点不变', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt10b-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 * Math.exp(0.004 * i + 0.00002 * i * i))
+  const endDate = new Date('2026-11-11')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.15, l: Math.min(o, c) - 0.15, v: 6000 }
+  })
+  bars[bars.length - 1].v = 30000
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-11T15:20:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-11T18:01:00+08:00')
+  let prevSettle = closes[closes.length - 2]
+  const now = () => clock
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], prevSettle, quoteAt: clock.getTime() }],
+    fetchBars: async () => bars,
+    now,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  const b1 = await rt.tick({ equity: 1000000 })
+  assert.equal(b1.alerts.filter((a) => a.kind === 'confirm').length, 1, '18:01 应推一条确认')
+  const firstPrice = b1.confirmed[0].entryRef
+  // 真实事故组合：21:00 夜盘归属次日（seen.clear），同时权益变更重置 confirmDay
+  prevSettle = prevSettle * 0.9
+  clock = new Date('2026-11-11T21:00:00+08:00')
+  const b2 = await rt.tick({ equity: 1500000 })
+  assert.equal(b2.alerts.filter((a) => a.kind === 'confirm').length, 0, '同一收盘日不应重复推确认')
+  assert.equal(b2.confirmed[0].entryRef, firstPrice, '重扫必须复用首次确认的比价锚点')
+})
+
+test('runtime：日志 ratio 优先，旧价格反推不覆盖已有锚点', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-ratio-seed-'))
+  const day = '2026-11-11'
+  const journalPath = path.join(tmp, 'alerts.jsonl')
+  fs.writeFileSync(journalPath, [
+    JSON.stringify({ type: 'trend', kind: 'confirm', code: 'RB0', day, price: 105, close: 100 }),
+    JSON.stringify({ type: 'trend', kind: 'confirm', code: 'HC0', day, price: 105, close: 100 }),
+    JSON.stringify({ type: 'trend', kind: 'confirm', code: 'I0', day, ratio: 1.06, price: 1, close: 1 }),
+  ].join('\n'))
+  fs.writeFileSync(path.join(tmp, 'runtime-state.json'), JSON.stringify({
+    ratioAnchorVersion: 2,
+    ratioAnchor: { [`RB0|${day}`]: 1.02, [`I0|${day}`]: 1.0 },
+  }))
+  const rt = createTrendRuntime({
+    codes: ['RB0'], catalogByCode: new Map(), sectorOf: () => '黑色',
+    fetchSnapshots: async () => [], fetchBars: async () => [],
+    cacheFile: path.join(tmp, 'cache.json'),
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+    journal: { file: journalPath, write: () => true },
+  })
+  assert.equal(rt.state.ratioAnchor.get(`RB0|${day}`), 1.02, '旧日志无 ratio 时不能覆盖已有锚点')
+  assert.equal(rt.state.ratioAnchor.get(`HC0|${day}`), 1.05, '没有锚点时才允许用价格反推回退')
+  assert.equal(rt.state.ratioAnchor.get(`I0|${day}`), 1.06, '日志有 ratio 时应以 ratio 为准')
+})
+
 test('entryWindowText：把「明日开盘」翻译成具体窗口', () => {
   const t = (target, iso) => entryWindowText(target, new Date(iso))
   assert.ok(t('2026-11-11', '2026-11-11T16:00:00+08:00').includes('今晚 21:00 夜盘'))
@@ -528,6 +597,307 @@ test('entryWindowText：把「明日开盘」翻译成具体窗口', () => {
   assert.ok(t('2026-11-11', '2026-11-12T08:00:00+08:00').includes('2026-11-12 09:00 早盘'))
   assert.ok(t('2026-11-11', '2026-11-12T10:00:00+08:00').includes('已开盘'))
   assert.ok(t('2026-11-13', '2026-11-14T10:00:00+08:00').includes('2026-11-16 09:00 早盘'))
+})
+
+test('mergeBars：同日覆盖、按日期排序', () => {
+  const m = mergeBars(
+    [{ date: '2026-11-10', c: 1 }, { date: '2026-11-11', c: 2 }],
+    [{ date: '2026-11-11', c: 3 }, { date: '2026-11-12', c: 4 }],
+  )
+  assert.deepEqual(m.map((b) => b.date), ['2026-11-10', '2026-11-11', '2026-11-12'])
+  assert.equal(m[1].c, 3, '同日应被新值覆盖')
+})
+
+test('runtime：增量刷新只拉最近 30 天', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt11-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-12')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-12T15:20:00+08:00').getTime(), bars: { RB: bars } }))
+  let seen = null
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: Date.now() }],
+    fetchBars: async (v, range) => {
+      calls += 1
+      seen = range
+      return [
+        { date: '2026-11-12', o: 140, c: 141, h: 142, l: 139, v: 6000 },
+        { date: '2026-11-13', o: 141, c: 142, h: 143, l: 140, v: 6000 },
+      ]
+    },
+    now: () => new Date('2026-11-13T15:20:00+08:00'),
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  const body = await rt.tick()
+  assert.equal(calls, 1)
+  assert.equal(seen.begin, '20261013', `应从 11-12 往前 30 天开始拉，实际 ${seen.begin}`)
+  assert.equal(seen.end, '20261113')
+  assert.equal(body.date, '2026-11-13')
+})
+
+test('runtime：周末已确认后不再刷新日线', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt12-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-13')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-13T15:20:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-13T16:00:00+08:00')
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: clock.getTime() }],
+    fetchBars: async () => { calls += 1; return bars },
+    now: () => clock,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  const friday = await rt.tick()
+  assert.equal(friday.confirmDay, '2026-11-13', '周五应先完成确认')
+  calls = 0
+  clock = new Date('2026-11-14T10:00:00+08:00') // 周六
+  const sat = await rt.tick()
+  assert.equal(calls, 0, '周末已确认后不应再刷新日线')
+  assert.equal(sat.confirmDay, '2026-11-13', '确认日不应变化')
+})
+
+test('runtime：盘中刷新间隔为 2 小时', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt14-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-13')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-13T08:00:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-13T09:30:00+08:00')
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: clock.getTime() }],
+    fetchBars: async () => { calls += 1; return bars },
+    now: () => clock,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  await rt.tick() // 09:30，距 08:00 仅 1.5 小时
+  assert.equal(calls, 0, '盘中 2 小时内不应刷新')
+  clock = new Date('2026-11-13T10:05:00+08:00') // 2h05
+  await rt.tick()
+  assert.equal(calls, 1, '满 2 小时应刷新一次')
+})
+
+test('runtime：刷新失败后按退避间隔重试', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt13-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-13')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-13T15:20:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-13T18:30:00+08:00')
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: clock.getTime() }],
+    fetchBars: async () => { calls += 1; throw new Error('upstream down') },
+    now: () => clock,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  await rt.tick() // 18:30 距 15:20 超过 3 小时，但不足 4 小时 → 不刷
+  assert.equal(calls, 0, '收盘 4 小时窗口内不应刷新')
+  clock = new Date('2026-11-13T19:25:00+08:00') // 4h05
+  await rt.tick()
+  assert.equal(calls, 1, '超过 4 小时应尝试一次')
+  clock = new Date('2026-11-13T19:30:00+08:00')
+  await rt.tick()
+  assert.equal(calls, 1, '失败后 30 分钟内不应重试')
+  clock = new Date('2026-11-13T19:56:00+08:00') // 首次失败后 31 分钟
+  await rt.tick()
+  assert.equal(calls, 2, '30 分钟后应再试一次')
+})
+
+test('runtime：连续失败 3 次后熔断 6 小时', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt15-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-13')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-13T09:00:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-13T15:20:00+08:00')
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: clock.getTime() }],
+    fetchBars: async () => { calls += 1; throw new Error('fetch failed') },
+    now: () => clock,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  await rt.tick() // 第 1 次失败
+  clock = new Date('2026-11-13T15:51:00+08:00')
+  await rt.tick() // 第 2 次失败
+  clock = new Date('2026-11-13T16:52:00+08:00')
+  const b3 = await rt.tick() // 第 3 次失败 → 熔断 6h
+  assert.equal(calls, 3)
+  assert.equal(b3.refreshFailures, 3)
+  assert.ok(b3.refreshPausedUntil > clock.getTime(), '应进入 6 小时熔断')
+  clock = new Date('2026-11-13T17:00:00+08:00')
+  await rt.tick()
+  assert.equal(calls, 3, '熔断期内不应再请求')
+  clock = new Date('2026-11-13T22:53:00+08:00') // 6 小时后
+  await rt.tick()
+  assert.equal(calls, 4, '熔断结束后应再试一次')
+})
+
+test('runtime：刷新成功后清除失败计数与熔断', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt16-'))
+  const file = path.join(tmp, 'cache.json')
+  const closes = Array.from({ length: 140 }, (_, i) => 100 + 0.3 * i)
+  const endDate = new Date('2026-11-13')
+  const bars = closes.map((c, i) => {
+    const d = new Date(endDate); d.setDate(d.getDate() - (closes.length - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.2, l: Math.min(o, c) - 0.2, v: 6000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-13T09:00:00+08:00').getTime(), bars: { RB: bars } }))
+  let clock = new Date('2026-11-13T15:20:00+08:00')
+  let calls = 0
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[closes.length - 1], quoteAt: clock.getTime() }],
+    fetchBars: async () => {
+      calls += 1
+      if (calls === 1) throw new Error('fetch failed')
+      return bars
+    },
+    now: () => clock,
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  await rt.tick() // 失败
+  clock = new Date('2026-11-13T15:51:00+08:00')
+  const ok = await rt.tick() // 成功
+  assert.equal(ok.refreshFailures, 0, '成功后失败计数应清零')
+  assert.equal(ok.refreshPausedUntil, null, '成功后不应有熔断')
+})
+
+await testAsync('runtime：重启后补算的仓位带 backfilled 标记', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt17-'))
+  const file = path.join(tmp, 'cache.json')
+  fs.writeFileSync(path.join(tmp, 'runtime-state.json'), JSON.stringify({ lastTickAt: new Date('2026-10-25T15:00:00+08:00').getTime() }))
+  const n = 140
+  const closes = []
+  for (let i = 0; i < n; i++) closes.push(i < 120 ? 100 + 0.05 * (i % 7) : 100 * Math.pow(1.01, i - 119))
+  const end = new Date('2026-11-19')
+  const bars = closes.map((c, i) => {
+    const d = new Date(end); d.setDate(d.getDate() - (n - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.3, l: Math.min(o, c) - 0.3, v: i >= 120 ? 6000 : 1000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-19T16:00:00+08:00').getTime(), bars: { RB: bars } }))
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[n - 1], quoteAt: new Date('2026-11-19T16:00:00+08:00').getTime() }],
+    fetchBars: async () => bars,
+    now: () => new Date('2026-11-19T16:00:00+08:00'),
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  const body = await rt.tick({ equity: 1000000 })
+  assert.equal(body.autoPositions.length, 1)
+  assert.equal(body.autoPositions[0].backfilled, true, '离线期间补算的仓位应带补算标记')
+  assert.equal(body.zeroLots.length, 0)
+})
+
+await testAsync('runtime：0 手信号只提醒、不进入持仓', async () => {
+  const { createTrendRuntime } = await import('../trend-runtime.js')
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trend-rt18-'))
+  const file = path.join(tmp, 'cache.json')
+  const n = 140
+  const closes = []
+  for (let i = 0; i < n; i++) closes.push(i < 120 ? 100 + 0.05 * (i % 7) : 100 * Math.pow(1.01, i - 119))
+  const end = new Date('2026-11-19')
+  const bars = closes.map((c, i) => {
+    const d = new Date(end); d.setDate(d.getDate() - (n - 1 - i))
+    const o = i ? closes[i - 1] : c
+    return { date: d.toISOString().slice(0, 10), o, c, h: Math.max(o, c) + 0.3, l: Math.min(o, c) - 0.3, v: i >= 120 ? 6000 : 1000 }
+  })
+  fs.writeFileSync(file, JSON.stringify({ updatedAt: new Date('2026-11-19T16:00:00+08:00').getTime(), bars: { RB: bars } }))
+  const rt = createTrendRuntime({
+    codes: ['RB0'],
+    catalogByCode: new Map([['RB0', { label: '螺纹' }]]),
+    sectorOf: () => '黑色',
+    fetchSnapshots: async () => [{ code: 'RB0', last: closes[n - 1], quoteAt: new Date('2026-11-19T16:00:00+08:00').getTime() }],
+    fetchBars: async () => bars,
+    now: () => new Date('2026-11-19T16:00:00+08:00'),
+    journal: { write: () => true },
+    cacheFile: file,
+    suppressFile: path.join(tmp, 'suppress.json'),
+    startFile: path.join(tmp, 'start.json'),
+  })
+  const body = await rt.tick({ equity: 1000 })
+  assert.equal(body.positions.length, 0, '0 手不应进入持仓')
+  assert.equal(body.zeroLots.length, 1)
+  assert.match(body.zeroLots[0].reason, /装不下 1 手/)
+  assert.ok(body.alerts.some((a) => a.kind === 'zero-lot'), '应产生 0 手提醒')
 })
 
 console.log('')

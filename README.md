@@ -26,25 +26,23 @@ Signals are computed on EastMoney's **weighted index** (`159.<variety>fi`) to av
 index itself is not tradeable, so fills are modelled at the next open of the main continuous contract.
 
 Backtest conventions and known caveats: [docs/trend-strategy.md](docs/trend-strategy.md) (Chinese).
-The SAR stop variant was retracted after a look-ahead fix (PF 1.14 vs 1.39) and the default is the
-fixed stop.
+The SAR stop variant was retracted after a look-ahead fix (PF 1.14 vs 1.39); the default is now the
+C1 structural stop (struct_atr / 1% / 50%).
 
-## Backtest (2015-01 → 2026-11, 0.2% cost, cap 8 / 2 per sector / 0.6% risk / 12% cap)
+## Backtest (C1 structural-stop approximation, 2015-01 → 2026-11)
 
-| Metric | Weighted index | Main continuous |
-|---|---:|---:|
-| Trades | 1641 | 1644 |
-| Win rate | 40.0% | 38.8% |
-| Average per trade | +0.71% | +0.52% |
-| Profit factor | 1.39 | 1.26 |
-| Annualized return | +6.7% | +6.2% |
-| Max drawdown | −14.7% | −19.0% |
-| Calmar | 0.46 | 0.33 |
+| Metric | C1 approximation |
+|---|---:|
+| Trades | 1202 |
+| Win rate | 29.1% |
+| Profit factor | 1.65 |
+| Annualized return | +20.2% |
+| Max drawdown | −26.8% |
 
-Per-trade figures come from 1641 / 1644 trades; annualized return, max drawdown and Calmar come from
-the portfolio simulation (960 / 973 trades after the 8-concurrent / 2-per-sector limits). Longest
-underwater period: 2016-11 → 2020-03 (weighted). The main-continuous column is the
-execution-realistic figure and should be preferred for expectations.
+Conventions: weighted index, 0.2% cost, max 8 concurrent / 2 per sector, C1 (struct_atr / 1% / 50%).
+This is a simplified replay: no daily mark-to-market and no portfolio caps (150% notional / 30% margin /
+5% risk), so live results should be lower. The old fixed 5% / 0.6% / 12% figures (1641 trades, PF 1.39,
++6.7% annualized, 14.7% drawdown) no longer describe the default strategy.
 
 ## Alerts
 
@@ -52,7 +50,7 @@ execution-realistic figure and should be preferred for expectations.
 |---|---|---|
 | `trigger` | Price crosses the 55-day high/low intraday (warning only) | normal |
 | `stop` | A position touches its stop price | strong |
-| `tp` | A position reaches 2R (**hint only**, not part of backtest exits) | amber |
+| `tp` | A position reaches 2R (**hint only**, not part of backtest exits) | major |
 | `confirm` | After the close: close beyond the channel + volume ratio + TRIX all pass. The alert states the concrete entry window (tonight's 21:00 night session / next day 09:00 morning session); whether to open is decided by the next-session task list (accepted by the portfolio → strong, rejected → normal) | strong/normal |
 
 Each variety + kind + trading day alerts at most once.
@@ -60,7 +58,7 @@ Each variety + kind + trading day alerts at most once.
 **Trigger ≠ entry.** A trigger only means the price crossed the channel intraday; the close may pull
 back, or volume/TRIX may fail. `confirm` is a post-close re-check and does **not** create an order by
 itself — the next-session task list does, under the same portfolio rules (8 concurrent, 2 per sector).
-The settings panel labels every confirmation with "passed portfolio constraints" or "no entry + reason",
+The Signals tab labels every confirmation with "passed portfolio constraints" or "no entry + reason",
 and lists unconfirmed varieties with the reason (close back inside, volume too low, TRIX not aligned).
 
 ## Journal
@@ -82,28 +80,31 @@ jq -r 'select(.code=="RB0") | [.day,.kind,.price,.text] | @tsv' \
   ~/.dsh/futures-radar/alerts.jsonl
 ```
 
-## Position calculator (settings panel)
+## Sizing profiles (C1 default / C2 observation)
 
-Two inputs:
+Open the left-sidebar **Trend Radar** entry → **Config**. Enter dynamic account equity; risk per trade
+is fixed by the profile:
 
-| Field | Meaning |
-|---|---|
-| **Account equity** | The futures account's dynamic equity (previous balance + PnL + cash flows), not available margin |
-| **Risk per trade** | Default 0.6%: maximum loss per trade as a share of equity |
-
-Lots are computed as:
+| Profile | Risk/trade | Portfolio notional | Portfolio margin | Portfolio risk | Notes |
+|---|---|---|---|---|---|
+| **C1 conservative (default)** | 1.0% | 150% | 30% | 5% | Structural stop + 0.3ATR; 1 CU lot ≈ 1.8% risk, 0 lots at 1M |
+| **C2 observation** | 1.5% | 200% | 40% | 8% | More aggressive, comparison only |
 
 ```
-stop distance = |entry − stop| / entry        (always 5% with the fixed stop)
-position size = min(0.6% ÷ stop distance, 12%)
-lots           = equity × position size ÷ (entry × contract multiplier)   (rounded down)
+stop distance = broken 55-day level + 0.3ATR (falls back to 1.5ATR when the level is on the wrong side, 1%–8%)
+position size = min(risk/trade ÷ stop distance, 50%)
+lots          = min(notional budget ÷ contract, risk budget ÷ per-lot risk)   (rounded down)
 ```
+
+Portfolio caps keep positions oldest-first and drop the **newest** position when notional, margin or
+risk would exceed the cap; rejected entries are returned as `capRejected`.
 
 Contract multipliers live in `data/multipliers.json`; the `unverified` list (BZ/PL/AD) should be
 checked against exchange notices.
 
-> With the default 5% fixed stop, `0.6% ÷ 5% = 12%`, so the position is always at the 12% cap — the
-> calculator converts that notional into **lots**, it is not a dynamic risk-parity allocator.
+When the computed lots are 0 the plugin raises a **0-lot signal** alert and does **not** enter a
+position. Positions reconstructed from daily bars while the plugin was offline are tagged
+**backfilled** (not live-confirmed).
 
 ## CLI
 
@@ -129,20 +130,29 @@ Default output (monitoring scope only):
 
 ```sh
 npm run check                     # syntax
-npm run selftest                  # 28 strategy + 21 alert tests
+npm run selftest                  # 28 strategy + 30 alert tests
 npm run selftest:trend            # strategy logic
 npm run selftest:trend:monitor    # alert logic (incl. runtime end-to-end)
 ```
 
-## Settings
+## Entry and config
 
-The settings panel exposes: enable switch, included/excluded varieties (searchable by Chinese name),
-quiet hours, account equity and risk per trade.
+The left-sidebar **Trend Radar** icon opens the main page with two tabs:
+
+- **Signals**: status, positions (lots/actual risk/margin), 0-lot signals, next-day tasks, close confirmation, recent alerts;
+- **Config**: account equity, sizing profile (C1/C2), included/excluded varieties.
+
+There is no standalone settings page, enable switch or quiet hours any more; removing the plugin stops it.
+A 30-minute pause remains at the top of the Signals tab.
 
 ## Data and limitations
 
 - Sources: EastMoney weighted index (daily klines), Sina real-time snapshots.
-- Daily cache: `~/.dsh/futures-radar/trend-daily.json`, refreshed at most every 30 minutes.
+- Daily cache: `~/.dsh/futures-radar/trend-daily.json`. Refreshes are incremental (only the last 30 days
+  once history exists): every 2 hours while the market is open and every 30 minutes in the 15:00–18:00
+  settlement window, every 4 hours otherwise, and not on weekends once the day's confirmation is done. Failed
+  refreshes back off 30m → 1h → 2h → 4h (capped at 6h). Requests are spaced 1–2s apart; after 3
+  consecutive failed refreshes the plugin trips a breaker (6h, then 12h, then 24h).
 - The weighted index is not tradeable; stops are intraday-touch fills with gap opens honoured; limit-up
   / limit-down days are not special-cased; 2R is a hint, real exits use MA20 / TRIX / fixed stop / time.
 - Price mapping: alert levels convert weighted-index levels to the main contract using
@@ -162,7 +172,7 @@ quiet hours, account equity and risk per trade.
 
 ## Install
 
-Requires Node.js 18+ and a DSH build that provides the `webServer` service.
+Requires Node.js 22+ and a DSH build that provides the `webServer` service.
 
 1. Link or copy this package into the profile's `node_modules`:
 
@@ -178,7 +188,7 @@ Requires Node.js 18+ and a DSH build that provides the `webServer` service.
          name: 'dsh-futures-radar'
    ```
 
-3. Restart DSH (or toggle the plugin) and enable it in the settings panel.
+3. Restart DSH (or toggle the plugin) and open **Trend Radar** in the left sidebar.
 
 ## License
 

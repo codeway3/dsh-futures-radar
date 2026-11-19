@@ -27,6 +27,7 @@ export const TREND_DEFAULTS = {
   dedupeDays: 20,     // 同品种信号去重
   maxPositions: 8,    // 并发持仓上限
   maxSector: 2,       // 同板块同向上限
+  backfillMinVr: 1.3, // 板块第二个名额（补位）的最低量比，防止弱信号占坑
   warmup: 70,         // 计算指标所需最少 K 线
   minVol20: 5000,     // 近 20 日均量兜底下限（只挡极端不活跃；主过滤仍是 catalog 的 liquid 标记）
   volAllow: ['EC'],   // 成交量低但必须监控的品种（EC 集运欧线）
@@ -40,6 +41,57 @@ export const REBOUND_CONFIG = {
   lookback: 10,
   channel: 0,         // 辅2 不用通道
   stopMode: 'fixed',  // 辅2 保持 5% 固定止损
+}
+
+/** 定仓方案：C1 默认，C2 仅作观察（更激进） */
+export const SIZING_PROFILES = {
+  C1: {
+    key: 'C1', label: 'C1 保守',
+    riskPct: 1.0, maxWeightPct: 50,
+    maxNotionalPct: 150, maxMarginPct: 30, maxRiskPct: 5,
+    marginRatePct: 10,
+    stopMode: 'struct_atr', atrMult: 1.5, bufferAtr: 0.3,
+    minStopPct: 1.0, maxStopPct: 8,
+  },
+  C2: {
+    key: 'C2', label: 'C2 观察',
+    riskPct: 1.5, maxWeightPct: 50,
+    maxNotionalPct: 200, maxMarginPct: 40, maxRiskPct: 8,
+    marginRatePct: 10,
+    stopMode: 'struct_atr', atrMult: 1.5, bufferAtr: 0.3,
+    minStopPct: 1.0, maxStopPct: 8,
+  },
+}
+
+/**
+ * 建仓止损：默认 5% 固定；C1/C2 用「55 日破位 + 0.3ATR 缓冲」，
+ * 结构位落在入场错误一侧时退回 1.5ATR；距离限制在 0.5%–8%。
+ */
+export function entryStopPrice(row, entryPrice, dir, cfg = TREND_DEFAULTS) {
+  const fixed = dir > 0 ? entryPrice * (1 - cfg.stopPct / 100) : entryPrice * (1 + cfg.stopPct / 100)
+  if (cfg.stopMode !== 'struct_atr') return fixed
+  const atr = Number(row?.atrPct)
+  if (!Number.isFinite(atr) || atr <= 0) return fixed
+  const level = dir > 0 ? row.hh : row.ll
+  const buf = Number.isFinite(cfg.bufferAtr) ? cfg.bufferAtr : 0.3
+  const mult = Number.isFinite(cfg.atrMult) ? cfg.atrMult : 1.5
+  let stop = NaN
+  if (Number.isFinite(level)) {
+    if (dir > 0) {
+      const s = level * (1 - (buf * atr) / 100)
+      if (s < entryPrice) stop = s
+    } else {
+      const s = level * (1 + (buf * atr) / 100)
+      if (s > entryPrice) stop = s
+    }
+  }
+  if (!Number.isFinite(stop)) stop = dir > 0 ? entryPrice * (1 - (mult * atr) / 100) : entryPrice * (1 + (mult * atr) / 100)
+  const minPct = Number.isFinite(cfg.minStopPct) ? cfg.minStopPct : 1.0
+  const maxPct = Number.isFinite(cfg.maxStopPct) ? cfg.maxStopPct : 8
+  const distPct = (Math.abs(stop - entryPrice) / entryPrice) * 100
+  if (distPct < minPct) stop = dir > 0 ? entryPrice * (1 - minPct / 100) : entryPrice * (1 + minPct / 100)
+  if (distPct > maxPct) stop = dir > 0 ? entryPrice * (1 - maxPct / 100) : entryPrice * (1 + maxPct / 100)
+  return stop
 }
 
 const num = (x) => (Number.isFinite(x) ? x : NaN)
@@ -214,6 +266,11 @@ export function sarSeries(high, low, step = 0.02, maxStep = 0.2) {
  * stopMode='sar_floor'  → SAR 与 stopPct 灾难底线取更靠近价格的那个
  */
 export function stopLevel(row, pos, cfg = TREND_DEFAULTS) {
+  if (cfg.stopMode === 'struct_atr') {
+    // 持仓的止损在建仓时已固定；没有 stopPrice 时按当前结构位估算（确认/计划用）
+    if (pos && Number.isFinite(pos.stopPrice)) return pos.stopPrice
+    return entryStopPrice(row, pos.entryPrice, pos.dir, cfg)
+  }
   const fixed = pos.dir > 0 ? pos.entryPrice * (1 - cfg.stopPct / 100) : pos.entryPrice * (1 + cfg.stopPct / 100)
   if (cfg.stopMode !== 'sar_floor' && cfg.stopMode !== 'sar') return fixed
   const sar = row?.sar
@@ -236,12 +293,17 @@ export function positionLots({
   const distPct = (dist / entryPrice) * 100
   const weightPct = Math.min((riskPct / distPct) * 100, maxWeightPct)
   const budget = equity * weightPct / 100
-  const lots = Math.max(0, Math.floor(budget / (entryPrice * multiplier)))
+  const contract = entryPrice * multiplier
+  const lotRisk = dist * multiplier
+  // 同时受「名义预算」和「风险预算」约束，避免名义封顶时单笔风险超标
+  const byNotional = Math.floor(budget / contract)
+  const byRisk = lotRisk > 0 ? Math.floor((equity * riskPct / 100) / lotRisk) : 0
+  const lots = Math.max(0, Math.min(byNotional, byRisk))
   return {
     weightPct,
     lots,
-    notional: lots * entryPrice * multiplier,
-    riskAmount: lots * dist * multiplier,
+    notional: lots * contract,
+    riskAmount: lots * lotRisk,
     distPct,
   }
 }
@@ -324,7 +386,7 @@ export function closeExit(row, pos, cfg = TREND_DEFAULTS) {
  * 状态机：从历史 bar 推演到最后一根，返回当前持仓与全部已平仓交易。
  * 入场按「次日开盘」，止损按盘中价（跳空按开盘价），MA/TRIX 出场按收盘价。
  */
-export function replaySeries(series, { cfg = TREND_DEFAULTS, signalFn = breakoutAt, sector = '其他' } = {}) {
+export function replaySeries(series, { cfg = TREND_DEFAULTS, signalFn = breakoutAt, sector = '其他', fromDate = null } = {}) {
   const trades = []
   let pos = null
   let lastSignalIndex = -Infinity
@@ -357,9 +419,11 @@ export function replaySeries(series, { cfg = TREND_DEFAULTS, signalFn = breakout
       const sig = signalFn(series, i, cfg)
       if (sig) {
         const entry = series[i + 1]
-        if (Number.isFinite(entry.o) && entry.o > 0) {
+        // 回放重置：起点日及之前只用于指标预热，不建仓
+        const beforeStart = fromDate && entry?.date && entry.date <= fromDate
+        if (!beforeStart && Number.isFinite(entry.o) && entry.o > 0) {
           lastSignalIndex = i
-          const stopPrice = sig > 0 ? entry.o * (1 - cfg.stopPct / 100) : entry.o * (1 + cfg.stopPct / 100)
+          const stopPrice = entryStopPrice(series[i], entry.o, sig, cfg)
           pos = {
             dir: sig, sector, signalIndex: i, signalDate: row.date,
             entryIndex: i + 1, entryDate: entry.date, entryPrice: entry.o, stopPrice,
@@ -386,9 +450,9 @@ function reboundAt(series, i, cfg) {
  * 单品种的明日任务。
  * @returns {null|{action:'open'|'close'|'reverse',dir:number,reason:string,...}}
  */
-export function planVariety(series, { cfg = TREND_DEFAULTS, channel = 'main', sector = '其他', signalFn: injected = null } = {}) {
+export function planVariety(series, { cfg = TREND_DEFAULTS, channel = 'main', sector = '其他', signalFn: injected = null, fromDate = null } = {}) {
   const signalFn = injected || (channel === 'main' ? breakoutAt : reboundAt)
-  const { pos, stoppedToday, lastSignalIndex } = replaySeries(series, { cfg, signalFn, sector })
+  const { pos, stoppedToday, lastSignalIndex } = replaySeries(series, { cfg, signalFn, sector, fromDate })
   const i = series.length - 1
   const row = series[i]
   const sig = signalFn(series, i, cfg)
@@ -452,8 +516,15 @@ export function buildPlan(tasks, openPositions, cfg = TREND_DEFAULTS) {
       rejected.push({ ...t, reject: `板块「${t.sector}」已达上限 ${cfg.maxSector}` })
       continue
     }
+    // 第二个同板块名额是补位：量比太弱就不占坑，宁可少做
+    const backfill = sectorCount > 0
+    const minVr = Number(cfg.backfillMinVr)
+    if (backfill && Number.isFinite(minVr) && (Number(t.vr) || 0) < minVr) {
+      rejected.push({ ...t, reject: `补位量比 ${Number(t.vr || 0).toFixed(2)} < ${minVr}，不占板块名额` })
+      continue
+    }
     held.push({ code: t.code, sector: t.sector, dir: t.dir })
-    accepted.push(t)
+    accepted.push({ ...t, backfill })
   }
 
   return { accepted, rejected, closes }
